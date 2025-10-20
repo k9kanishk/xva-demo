@@ -830,14 +830,7 @@ const theta = (thetaForward.cva - base.cva) / day; // $ per year
 
 function MiniCard({ title, value }: { title: string; value: string }) {
   return (
-    <div
-      style={{
-        padding: 12,
-        border: "1px solid #eee",
-        borderRadius: 8,
-        background: "#fff",
-      }}
-    >
+    <div style={{ padding: 12, border: "1px solid #eee", borderRadius: 8, background: "#fff" }}>
       <div style={{ fontSize: 12, color: "#666" }}>{title}</div>
       <div style={{ fontSize: 20, fontWeight: 700 }}>{value}</div>
     </div>
@@ -845,21 +838,11 @@ function MiniCard({ title, value }: { title: string; value: string }) {
 }
 
 function LabelNumber({
-  label,
-  value,
-  onChange,
-  step = 1,
-}: {
-  label: string;
-  value: number;
-  onChange: (v: number) => void;
-  step?: number;
-}) {
+  label, value, onChange, step = 1,
+}: { label: string; value: number; onChange: (v: number) => void; step?: number }) {
   return (
     <div style={{ margin: "6px 0" }}>
-      <label style={{ display: "block", fontSize: 12, color: "#555" }}>
-        {label}
-      </label>
+      <label style={{ display: "block", fontSize: 12, color: "#555" }}>{label}</label>
       <input
         type="number"
         step={step}
@@ -872,31 +855,13 @@ function LabelNumber({
 }
 
 function LabelSelect({
-  label,
-  value,
-  options,
-  onChange,
-}: {
-  label: string;
-  value: string;
-  options: string[];
-  onChange: (v: string) => void;
-}) {
+  label, value, options, onChange,
+}: { label: string; value: string; options: string[]; onChange: (v: string) => void }) {
   return (
     <div style={{ margin: "6px 0" }}>
-      <label style={{ display: "block", fontSize: 12, color: "#555" }}>
-        {label}
-      </label>
-      <select
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        style={{ width: "100%" }}
-      >
-        {options.map((o) => (
-          <option key={o} value={o}>
-            {o}
-          </option>
-        ))}
+      <label style={{ display: "block", fontSize: 12, color: "#555" }}>{label}</label>
+      <select value={value} onChange={(e) => onChange(e.target.value)} style={{ width: "100%" }}>
+        {options.map(o => <option key={o} value={o}>{o}</option>)}
       </select>
     </div>
   );
