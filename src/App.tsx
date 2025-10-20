@@ -71,8 +71,6 @@ type CreditData = {
 };
 
 type RegulatoryConfig = {
-  jurisdiction: "us-basel3" | "eu-crr3" | "uk-pra";
-  cvaApproach: "advanced" | "standardized";
   alphaFactor: number;
   multiplier: number;
 };
@@ -312,8 +310,6 @@ export default function App() {
     recoveryRate: 0.4,
   });
   const [reg, setReg] = useState<RegulatoryConfig>({
-    jurisdiction: "us-basel3",
-    cvaApproach: "advanced",
     alphaFactor: 1.4,
     multiplier: 1.0,
   });
@@ -621,13 +617,7 @@ export default function App() {
             background: "#fff",
           }}
         >
-          <h3>Regulatory Config</h3>
-          <LabelSelect
-            label="Jurisdiction"
-            value={reg.jurisdiction}
-            options={["us-basel3", "eu-crr3", "uk-pra"]}
-            onChange={(v) => setReg({ ...reg, jurisdiction: v as any })}
-          />
+          <h3>Capital Overlay</h3>
           <LabelNumber
             label="Alpha Factor"
             step={0.1}
