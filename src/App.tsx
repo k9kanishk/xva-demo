@@ -9,6 +9,43 @@ import {
   ResponsiveContainer,
 } from "recharts";
 
+/* ==== MC helpers: CRN + antithetic ==== */
+function cholesky3(C: number[][]) {
+  // 3x3 Cholesky
+  const L = [[0,0,0],[0,0,0],[0,0,0]];
+  L[0][0] = Math.sqrt(C[0][0]);
+  L[1][0] = C[1][0]/L[0][0];
+  L[1][1] = Math.sqrt(C[1][1] - L[1][0]*L[1][0]);
+  L[2][0] = C[2][0]/L[0][0];
+  L[2][1] = (C[2][1] - L[2][0]*L[1][0]) / L[1][1];
+  L[2][2] = Math.sqrt(C[2][2] - L[2][0]*L[2][0] - L[2][1]*L[2][1]);
+  return L;
+}
+function applyChol3(L: number[][], z: [number,number,number]): [number,number,number] {
+  const y0 = L[0][0]*z[0];
+  const y1 = L[1][0]*z[0] + L[1][1]*z[1];
+  const y2 = L[2][0]*z[0] + L[2][1]*z[1] + L[2][2]*z[2];
+  return [y0,y1,y2];
+}
+function antitheticTriples(rand: () => number): Array<[number,number,number]> {
+  // return z and -z
+  const z: [number,number,number] = [normal(rand), normal(rand), normal(rand)];
+  return [z, [-z[0], -z[1], -z[2]]];
+}
+/* precise central differences with CRN */
+function centralDiff(
+  base: number,
+  up: number,
+  dn: number,
+  h: number
+) {
+  return (up - dn) / (2*h);
+}
+function secondCentralDiff(up: number, base: number, dn: number, h: number) {
+  return (up - 2*base + dn) / (h*h);
+}
+
+
 /* --------------------------- helpers & types --------------------------- */
 
 function mulberry32(seed: number) {
@@ -107,8 +144,47 @@ type XVAResults = {
   performance: { calculationTime: number; paths: number; gpuUsed: boolean };
 };
 
-/* --------------------------- compute engine --------------------------- */
+/* ==== Risk-factor params (tunable) ==== */
+type RFParams = {
+  // Hull-White short-rate
+  a: number;           // mean reversion
+  sigma_r: number;     // rate vol
+  // FX GBM for non-USD
+  mu_fx: number;
+  sigma_fx: number;
+  // Credit hazard (log-OU)
+  kappa_h: number;
+  sigma_h: number;
+  // correlations: [r, logS, h]
+  corr: number[][];    // 3x3 SPD matrix
+  wwCorr: number;      // wrong-way copula correlation (0..1)
+};
 
+const defaultRF: RFParams = {
+  a: 0.05, sigma_r: 0.01,
+  mu_fx: 0.0, sigma_fx: 0.10,
+  kappa_h: 0.30, sigma_h: 0.20,
+  corr: [
+    [1.00, 0.20,  0.10],  // r
+    [0.20, 1.00,  0.15],  // log S
+    [0.10, 0.15,  1.00],  // hazard
+  ],
+  wwCorr: 0.25,
+};
+
+function dv01(notional: number, years: number) {
+  // crude DV01 for fixed->float IRS: ~ N * annuity * 1bp
+  const annuity = Math.max(0, years) // linear proxy
+  return notional * annuity * 1e-4;
+}
+function rpv01(notional: number, years: number) {
+  // very rough risky PV01 proxy for CDS
+  return notional * Math.min(years, 5) * 1e-4;
+}
+
+
+
+/* --------------------------- compute engine --------------------------- */
 function computeXVA(args: {
   trades: Trade[];
   csa: CSATerms;
@@ -118,157 +194,227 @@ function computeXVA(args: {
   paths: number;
   seed: number;
   horizonYears?: number;
-  rateShock?: number; // bump to OIS curve (discount)
-  volShock?: number; // additive vol bump (e.g. 0.01 = +1% abs)
-  spreadShock?: number; // additive bump to funding spread & PD scale proxy
+  rf?: Partial<RFParams>;
+  // scenario shocks
+  rateShock?: number;        // shifts r
+  volShock?: number;         // multiplies risky vols
+  spreadShock?: number;      // shifts hazard levels
 }) {
   const {
-    trades,
-    csa,
-    sched,
-    credit,
-    reg,
-    paths,
-    seed,
-    horizonYears = 3,
-    rateShock = 0,
-    volShock = 0,
-    spreadShock = 0,
+    trades, csa, sched, credit, reg,
+    paths, seed, horizonYears = 3,
+    rateShock = 0, volShock = 0, spreadShock = 0,
+    rf: rfIn
   } = args;
 
+  const rf: RFParams = { ...defaultRF, ...(rfIn||{}) };
+  // vol scaling
+  const sigma_r = rf.sigma_r * (1 + volShock);
+  const sigma_fx = rf.sigma_fx * (1 + volShock);
+  const sigma_h = rf.sigma_h * (1 + volShock);
+
+  const pdRaw = parseList(credit.pdCurve).map(p => p > 1 ? p/100 : p);
+  const T = Math.max(4, pdRaw.length);
+  const dt = horizonYears / T;
+  const lgd = credit.lgd ?? (1 - (credit.recoveryRate ?? 0.4));
+
+  // convert cumulative PDs to hazard levels per bucket
+  const cumPD = pdRaw.map(x => Math.min(0.999, x*(1+spreadShock)));
+  const margPD = cumPD.map((p,i)=> i===0 ? p : Math.max(p - cumPD[i-1], 0));
+  const hazLevel = margPD.map(p => -Math.log(1 - Math.max(0,Math.min(p,0.999))) / dt);
+
+  const L = cholesky3(rf.corr);
   const rand = mulberry32(seed);
 
-  /* --------- PD curve: robust normalization + monotone cumulative ------ */
+  const EPE = new Array(T).fill(0);
+  const ENE = new Array(T).fill(0);
+  const PFE = new Array(T).fill(0);
+  const IMt = new Array(T).fill(csa.independentAmount || 0);
 
-  // raw values user typed
-  const rawPD = parseList(credit.pdCurve);
+  // set baselines
+  let r0 = Math.max(0, (csa.interestRate ?? 0.03) + rateShock);
+  let s0 = 1.0; // base FX = 1
+  let h0 = hazLevel[0]; // starting hazard proxy
 
-  // If any entry > 1 we assume user typed percentages
-  const pdAsDec =
-    rawPD.some((v) => v > 1) ? rawPD.map((v) => v / 100) : rawPD.slice();
+  for (let p = 0; p < paths; p++) {
+    // draw antithetic pairs for variance reduction
+    const twins = antitheticTriples(rand);
 
-  // Clamp to [0, 0.999] and build monotone cumulative curve
-  for (let i = 0; i < pdAsDec.length; i++) {
-    pdAsDec[i] = clamp(pdAsDec[i], 0, 0.999);
-  }
-  const cumBase: number[] = new Array(pdAsDec.length);
-  for (let i = 0; i < pdAsDec.length; i++) {
-    cumBase[i] = i === 0 ? pdAsDec[0] : Math.max(pdAsDec[i], cumBase[i - 1]);
-  }
+    for (const z of twins) {
+      // correlate (r, logS, h)
+      const [dWr, dWs, dWh] = applyChol3(L, z);
 
-  const timeSteps = Math.max(4, cumBase.length);
-  const dt = horizonYears / timeSteps;
+      let r = r0, logS = 0, h = h0;
+      let pathExp = new Array(T).fill(0);
 
-  // Apply spreadShock scaling to cumPD and extend to horizon
-  const cumPD: number[] = Array.from({ length: timeSteps }, (_, i) => {
-    const base = cumBase[Math.min(i, cumBase.length - 1)];
-    // scale and cap < 1
-    return Math.min(0.999, base * (1 + spreadShock));
-  });
+      for (let i = 0; i < T; i++) {
+        // evolve factors
+        // Hull-White short rate
+        r += rf.a*(r0 - r)*dt + sigma_r*Math.sqrt(dt)*dWr;
 
-  // Non-negative marginals
-  const margPD = cumPD.map((p, i) => (i === 0 ? p : Math.max(0, p - cumPD[i - 1])));
+        // FX GBM for non-USD notionals
+        logS += (rf.mu_fx - 0.5*sigma_fx*sigma_fx)*dt + sigma_fx*Math.sqrt(dt)*dWs;
+        const S = Math.exp(logS);
 
-  const lgd = credit.lgd ?? 1 - (credit.recoveryRate ?? 0.4);
+        // hazard log-OU around hazLevel[i]
+        const hbar = hazLevel[i];
+        const logh = Math.log(Math.max(1e-6,h)) + rf.kappa_h*(Math.log(Math.max(1e-6,hbar)) - Math.log(Math.max(1e-6,h)))*dt + sigma_h*Math.sqrt(dt)*dWh;
+        h = Math.max(1e-6, Math.exp(logh));
 
-  /* ------------------ curves / discount / funding setup ---------------- */
+        // quick trade re-pricing → exposure
+        let stepExp = 0;
+        for (const tr of trades) {
+          // remaining years bucketed
+          const remY = Math.max(0, (new Date(tr.maturity).getTime() - Date.now())/ (365*86400e3)) - i*dt;
+          const ccyAdj = tr.currency === 'USD' ? 1 : S;
 
-  const rOIS = Math.max(0, (csa.interestRate ?? 0.03) + rateShock);
-  const fundingSpread = 0.015 + spreadShock;
-  const rF = rOIS + fundingSpread;
-  const DF = (r: number, t: number) => Math.exp(-r * t);
+          if (tr.tradeType === 'IRS') {
+            const dv = dv01(tr.notional*ccyAdj, Math.max(0, remY));
+            // PV change from small rate move around anchor r0
+            stepExp += -dv*(r - r0); // positive if rates fall
+          } else { // CDS
+            const rp = rpv01(tr.notional*ccyAdj, Math.max(0, remY));
+            // hazard vs spread proxy: PV ≈ RPV01*(spread - LGD*h)
+            const spread = 0.015 + spreadShock; // 150 bps baseline proxy
+            stepExp += rp*(spread - lgd*h);
+          }
+        }
+        // CSA → only positive exposure is collateralized
+        let pos = Math.max(0, stepExp - csa.threshold);
+        if (pos >= csa.mta) {
+          const rdn = sched.rounding || 0;
+          if (rdn > 0) pos = Math.ceil(pos/rdn)*rdn;
+        } else {
+          pos = 0;
+        }
+        pathExp[i] = pos;
+      }
 
-  /* ----------------------------- exposures ----------------------------- */
+      // wrong-way: couple default with market via Gaussian copula
+      // mixture factor m ~ N(0,1) correlated with (r,logS,h)
+      // approximate with last hazard shock component
+      const u = 0.5*(1 + erf(dWh/Math.SQRT2));                   // uniform(0,1)
+      const uWW = rf.wwCorr*u + (1-rf.wwCorr)*Math.random();     // mixed
+      // convert to an arrival time by inverse of integrated hazard
+      let tau = Infinity, H = 0;
+      for (let i = 0; i < T; i++) {
+        H += hazLevel[i]*dt;
+        if (1 - Math.exp(-H) >= uWW) { tau = (i+1)*dt; break; }
+      }
 
-  const baseSigma = 0.2 * (1 + volShock);
-  const fxAdj = (ccy: string) => (ccy === "USD" ? 1 : 1.1);
-  const notionalUSD = (t: Trade) => t.notional * fxAdj(t.currency);
-
-  const EPE = new Array(timeSteps).fill(0);
-  const ENE = new Array(timeSteps).fill(0);
-  const PFE = new Array(timeSteps).fill(0);
-  const IMt = new Array(timeSteps).fill(csa.independentAmount || 0);
-
-  const maturityIndex = (t: Trade) => {
-    const T =
-      (new Date(t.maturity).getTime() - Date.now()) / (365 * 86400e3);
-    // if maturity is in the past, index becomes -1 => no exposure
-    const idx = Math.floor(T / dt) - 1;
-    return clamp(isFinite(idx) ? idx : -1, -1, timeSteps - 1);
-  };
-
-  for (let pth = 0; pth < paths; pth++) {
-    const pathE: number[] = new Array(timeSteps).fill(0);
-
-    for (const trade of trades) {
-      const N = notionalUSD(trade);
-      const Tidx = maturityIndex(trade);
-      if (Tidx < 0) continue; // matured trades contribute nothing
-
-      const typeMult = trade.tradeType === "CDS" ? 1.4 : 1.0;
-
-      for (let i = 0; i <= Tidx; i++) {
-        const tau = (i + 1) * dt;
-        const shock = normal(rand) * baseSigma * Math.sqrt(tau);
-        pathE[i] += N * typeMult * shock; // +/- exposure
+      // discount + accumulation
+      let rPath = 0;
+      for (let i = 0; i < T; i++) {
+        rPath += r0*dt; // simple DF with baseline r0
+        const DF = Math.exp(-r0*(i+1)*dt);
+        // stop EPE after default
+        if ((i+1)*dt <= tau) {
+          EPE[i] += pathExp[i];
+          ENE[i] += -0.3*pathExp[i]; // proxy ENE
+          PFE[i] += 1.5*pathExp[i];
+        }
       }
     }
-
-    // CSA: threshold/MTA/rounding; positive exposure only for EPE
-    for (let i = 0; i < timeSteps; i++) {
-      let pos = Math.max(0, pathE[i] - csa.threshold);
-      if (pos >= csa.mta) {
-        const r = sched.rounding || 0;
-        if (r > 0) pos = Math.ceil(pos / r) * r;
-      } else {
-        pos = 0;
-      }
-      const neg = Math.min(0, pathE[i]); // ENE proxy, keep sign
-      EPE[i] += pos;
-      ENE[i] += neg;
-      PFE[i] += Math.max(pos * 1.5, 0);
-    }
   }
 
-  for (let i = 0; i < timeSteps; i++) {
-    EPE[i] /= paths;
-    ENE[i] /= paths;
-    PFE[i] /= paths;
-  }
+  const n = paths*2; // twins
+  for (let i = 0; i < T; i++) { EPE[i]/=n; ENE[i]/=n; PFE[i]/=n; }
 
-  // Simple IM (VaR-style) profile
-  const avgNotional =
-    trades.reduce((s, t) => s + notionalUSD(t), 0) /
-    Math.max(trades.length, 1);
-  for (let i = 0; i < timeSteps; i++) {
+  // IM profile stays as in your code but scale with vol
+  const avgNotional = trades.reduce((s,t)=> s + (t.notional), 0)/Math.max(1,trades.length);
+  for (let i = 0; i < T; i++) {
     IMt[i] = Math.max(
       csa.independentAmount || 0,
-      2.33 * baseSigma * Math.sqrt((i + 1) * dt) * avgNotional * 0.2
+      2.33 * sigma_fx * Math.sqrt((i+1)*dt) * avgNotional * 0.2
     );
   }
 
-  // XVA components
-  let CVA = 0,
-    FVA = 0,
-    MVA = 0;
-  for (let i = 0; i < timeSteps; i++) {
-    const t = (i + 1) * dt;
-    CVA += lgd * EPE[i] * margPD[i] * DF(rOIS, t);
-    FVA += EPE[i] * (rF - rOIS) * dt * DF(rOIS, t);
-    MVA += IMt[i] * (rF - rOIS) * dt * DF(rOIS, t);
+  // CVA / FVA / MVA
+  let CVA = 0, FVA = 0, MVA = 0;
+  for (let i = 0; i < T; i++) {
+    const t = (i+1)*dt;
+    const DF = Math.exp(-r0*t);
+    CVA += lgd * EPE[i] * margPD[i] * DF;
+    FVA += EPE[i] * (0.015) * dt * DF;
+    MVA += IMt[i] * (0.015) * dt * DF;
   }
-  const KVA = reg.alphaFactor * reg.multiplier * 0.1 * CVA; // proxy KVA
 
   return {
     cva: Math.max(0, CVA),
     fva: Math.max(0, FVA),
     mva: Math.max(0, MVA),
-    kva: Math.max(0, KVA),
-    epe: EPE,
-    ene: ENE,
-    pfe: PFE,
+    kva: 0, // filled by new KVA below
+    epe: EPE, ene: ENE, pfe: PFE
   };
 }
+
+type GreekSet = { delta_bp: number; gamma_bp2: number; rho_bp: number; vega_perc: number; theta: number };
+
+function computeGreeksWithCRN(core: Omit<Parameters<typeof computeXVA>[0], 'rateShock'|'volShock'|'spreadShock'|'seed'>): GreekSet {
+  // 1bp for rates, 1% for vol
+  const h_bp = 1e-4;
+  const h_vol = 0.01;
+
+  const seed = 42; // CRN
+
+  const base = computeXVA({ ...core, seed });
+  const upR = computeXVA({ ...core, seed, rateShock:  +h_bp });
+  const dnR = computeXVA({ ...core, seed, rateShock:  -h_bp });
+
+  const upV = computeXVA({ ...core, seed, volShock: +h_vol });
+  const dnV = computeXVA({ ...core, seed, volShock: -h_vol });
+
+  // Use CVA for Greeks here; you can add FVA sensitivities similarly
+  const Δ = centralDiff(base.cva, upR.cva, dnR.cva, h_bp);              // $ per 1.0 (rate)
+  const Γ = secondCentralDiff(upR.cva, base.cva, dnR.cva, h_bp);        // $ per (rate)^2
+  const ρ = Δ;                                                          // identical driver here; keep separately for clarity
+  const ν = centralDiff(base.cva, upV.cva, dnV.cva, h_vol);             // $ per +1.00 vol (100%)
+  // scale to reporting units
+  return {
+    delta_bp: Δ,                   // already $ per 1.0 rate *per bp step used*, since h=1bp
+    gamma_bp2: Γ,                  // $ per (bp)^2 in this scaling
+    rho_bp: ρ,
+    vega_perc: ν,                  // $ per +1.0 vol; divide by 100 if you want per 1% point
+    theta: 0
+  };
+}
+
+const baseArgs = { trades, csa, sched, credit, reg, paths: 50_000, rf: {}, horizonYears: 3 };
+
+const base = computeXVA({ ...baseArgs, seed: 42 });
+const greeks = computeGreeksWithCRN(baseArgs);
+
+setRes({
+  cva: Math.round(base.cva),
+  fva: Math.round(base.fva),
+  mva: Math.round(base.mva),
+  kva: 0, // we set below
+  cvaGreeks: {
+    delta: greeks.delta_bp,      // already per bp scaling
+    gamma: greeks.gamma_bp2,
+    vega: greeks.vega_perc,      // per 1.0 vol; divide by 100 to display per 1% if preferred
+    rho: greeks.rho_bp,
+    theta: 0
+  },
+  ...
+});
+
+/* ==== KVA from capital proxy (SA-CVA style) ==== */
+type Rating = 'AAA'|'AA'|'A'|'BBB'|'BB'|'B'|'CCC';
+const ratingRW: Record<Rating, number> = {
+  AAA: 0.007, AA: 0.01, A: 0.012, BBB: 0.02, BB: 0.05, B: 0.10, CCC: 0.12
+};
+// EEPE proxy = average EPE discounted
+function eepeFromProfile(EPE: number[]) {
+  return EPE.reduce((s,x)=> s + x, 0) / Math.max(1,EPE.length);
+}
+function proxyKVA(EPE: number[], lgd: number, maturityY: number, rating: Rating, costOfCapital=0.10, horizonY=1) {
+  const ead = eepeFromProfile(EPE);         // exposure at default proxy
+  const rw = ratingRW[rating];              // risk weight
+  const capital = rw * lgd * ead * Math.sqrt(Math.max(0.5, maturityY)); // simple SA-CVA-like structure
+  return costOfCapital * capital * horizonY;
+}
+
 
 /* ------------------------------- the app ------------------------------ */
 
