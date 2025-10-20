@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   LineChart,
   Line,
@@ -9,7 +9,7 @@ import {
   ResponsiveContainer,
 } from "recharts";
 
-/* --------------------------- helpers --------------------------- */
+/* --------------------------- helpers & types --------------------------- */
 
 function mulberry32(seed: number) {
   return function () {
@@ -34,22 +34,8 @@ function parseList(str: string): number[] {
 const fmtUSD = (x: number) =>
   (x < 0 ? "-$" : "$") + Math.abs(Math.round(x)).toLocaleString();
 
-/* fast erf approximation (sufficient for copula uniform) */
-function erf(x: number) {
-  // Abramowitz–Stegun 7.1.26
-  const sign = Math.sign(x);
-  const a1 = 0.254829592,
-    a2 = -0.284496736,
-    a3 = 1.421413741,
-    a4 = -1.453152027,
-    a5 = 1.061405429,
-    p = 0.3275911;
-  const t = 1 / (1 + p * Math.abs(x));
-  const y =
-    1 -
-    (((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t) * Math.exp(-x * x);
-  return sign * y;
-}
+const clamp = (x: number, lo: number, hi: number) =>
+  Math.min(hi, Math.max(lo, x));
 
 /* ------------------------------- types -------------------------------- */
 
@@ -78,9 +64,10 @@ type CollateralSchedule = {
 };
 
 type CreditData = {
-  pdCurve: string; // "1,1.5,2,2.5,3" (%) OR decimals
+  pdCurve: string; // e.g. "1,1.5,2,2.5,3" in % OR "0.01,0.015..."
   lgd: number; // 0..1
   recoveryRate: number; // optional alt to lgd
+  cdsSpreads?: string;
 };
 
 type RegulatoryConfig = {
@@ -103,10 +90,10 @@ type XVAResults = {
   mva: number;
   kva: number;
   cvaGreeks: {
-    delta: number; // per 1bp
-    gamma: number; // per (bp)^2
-    vega: number;  // per +1.0 vol (100%)
-    rho: number;   // per 1bp
+    delta: number;
+    gamma: number;
+    vega: number;
+    rho: number;
     theta: number;
   };
   exposure: { date: string; epe: number; ene: number; pfe: number }[];
@@ -120,80 +107,8 @@ type XVAResults = {
   performance: { calculationTime: number; paths: number; gpuUsed: boolean };
 };
 
-/* ==== MC helpers: CRN + antithetic + correlation ==== */
-function cholesky3(C: number[][]) {
-  // 3x3 Cholesky
-  const L = [
-    [0, 0, 0],
-    [0, 0, 0],
-    [0, 0, 0],
-  ];
-  L[0][0] = Math.sqrt(C[0][0]);
-  L[1][0] = C[1][0] / L[0][0];
-  L[1][1] = Math.sqrt(C[1][1] - L[1][0] * L[1][0]);
-  L[2][0] = C[2][0] / L[0][0];
-  L[2][1] = (C[2][1] - L[2][0] * L[1][0]) / L[1][1];
-  L[2][2] = Math.sqrt(C[2][2] - L[2][0] * L[2][0] - L[2][1] * L[2][1]);
-  return L;
-}
-function applyChol3(
-  L: number[][],
-  z: [number, number, number]
-): [number, number, number] {
-  const y0 = L[0][0] * z[0];
-  const y1 = L[1][0] * z[0] + L[1][1] * z[1];
-  const y2 = L[2][0] * z[0] + L[2][1] * z[1] + L[2][2] * z[2];
-  return [y0, y1, y2];
-}
-function antitheticTriples(rand: () => number): Array<
-  [number, number, number]
-> {
-  const z: [number, number, number] = [normal(rand), normal(rand), normal(rand)];
-  return [z, [-z[0], -z[1], -z[2]]];
-}
-function centralDiff(up: number, dn: number, h: number) {
-  return (up - dn) / (2 * h);
-}
-function secondCentralDiff(up: number, base: number, dn: number, h: number) {
-  return (up - 2 * base + dn) / (h * h);
-}
+/* --------------------------- compute engine --------------------------- */
 
-/* ==== Risk-factor params (tunable) ==== */
-type RFParams = {
-  a: number; // Hull–White mean reversion
-  sigma_r: number; // rate vol
-  mu_fx: number; // FX drift
-  sigma_fx: number; // FX vol
-  kappa_h: number; // hazard mean reversion in log space
-  sigma_h: number; // hazard vol in log
-  corr: number[][]; // 3x3 SPD matrix for (r, logS, h)
-  wwCorr: number; // wrong-way copula correlation
-};
-const defaultRF: RFParams = {
-  a: 0.05,
-  sigma_r: 0.01,
-  mu_fx: 0.0,
-  sigma_fx: 0.10,
-  kappa_h: 0.30,
-  sigma_h: 0.20,
-  corr: [
-    [1.0, 0.20, 0.10],
-    [0.20, 1.0, 0.15],
-    [0.10, 0.15, 1.0],
-  ],
-  wwCorr: 0.25,
-};
-
-/* quick linearized pricing proxies */
-function dv01(notional: number, years: number) {
-  const annuity = Math.max(0, years);
-  return notional * annuity * 1e-4;
-}
-function rpv01(notional: number, years: number) {
-  return notional * Math.min(Math.max(0, years), 5) * 1e-4;
-}
-
-/* --------------------------- engine --------------------------- */
 function computeXVA(args: {
   trades: Trade[];
   csa: CSATerms;
@@ -203,11 +118,9 @@ function computeXVA(args: {
   paths: number;
   seed: number;
   horizonYears?: number;
-  rf?: Partial<RFParams>;
-  // scenario shocks
-  rateShock?: number; // shift in short rate level
-  volShock?: number; // multiply risky vols
-  spreadShock?: number; // shift hazard level
+  rateShock?: number; // bump to OIS curve (discount)
+  volShock?: number; // additive vol bump (e.g. 0.01 = +1% abs)
+  spreadShock?: number; // additive bump to funding spread & PD scale proxy
 }) {
   const {
     trades,
@@ -221,224 +134,147 @@ function computeXVA(args: {
     rateShock = 0,
     volShock = 0,
     spreadShock = 0,
-    rf: rfIn,
   } = args;
 
-  const rf: RFParams = { ...defaultRF, ...(rfIn || {}) };
-  const sigma_r = rf.sigma_r * (1 + volShock);
-  const sigma_fx = rf.sigma_fx * (1 + volShock);
-  const sigma_h = rf.sigma_h * (1 + volShock);
-
-  const pdRaw = parseList(credit.pdCurve).map((p) => (p > 1 ? p / 100 : p));
-  const T = Math.max(4, pdRaw.length);
-  const dt = horizonYears / T;
-  const lgd = credit.lgd ?? 1 - (credit.recoveryRate ?? 0.4);
-
-  // cumulative PD per bucket (+spread shock), convert to marginal PD and hazard
-  const cumPD = pdRaw.map((x) => Math.min(0.999, x * (1 + spreadShock)));
-  const margPD = cumPD.map((p, i) => (i === 0 ? p : Math.max(p - cumPD[i - 1], 0)));
-  const hazLevel = margPD.map((p) => -Math.log(1 - Math.min(0.999, Math.max(0, p))) / dt);
-
-  const L = cholesky3(rf.corr);
   const rand = mulberry32(seed);
 
-  const EPE = new Array(T).fill(0);
-  const ENE = new Array(T).fill(0);
-  const PFE = new Array(T).fill(0);
-  const IMt = new Array(T).fill(csa.independentAmount || 0);
+  /* --------- PD curve: robust normalization + monotone cumulative ------ */
 
-  // baselines
-  const r0 = Math.max(0, (csa.interestRate ?? 0.03) + rateShock);
-  let h0 = hazLevel[0];
+  // raw values user typed
+  const rawPD = parseList(credit.pdCurve);
 
-  for (let p = 0; p < paths; p++) {
-    const twins = antitheticTriples(rand);
-    for (const z of twins) {
-      const [dWr0, dWs0, dWh0] = applyChol3(L, z);
+  // If any entry > 1 we assume user typed percentages
+  const pdAsDec =
+    rawPD.some((v) => v > 1) ? rawPD.map((v) => v / 100) : rawPD.slice();
 
-      let r = r0,
-        logS = 0,
-        h = h0;
-      const pathExp = new Array(T).fill(0);
+  // Clamp to [0, 0.999] and build monotone cumulative curve
+  for (let i = 0; i < pdAsDec.length; i++) {
+    pdAsDec[i] = clamp(pdAsDec[i], 0, 0.999);
+  }
+  const cumBase: number[] = new Array(pdAsDec.length);
+  for (let i = 0; i < pdAsDec.length; i++) {
+    cumBase[i] = i === 0 ? pdAsDec[0] : Math.max(pdAsDec[i], cumBase[i - 1]);
+  }
 
-      for (let i = 0; i < T; i++) {
-        // evolve factors
-        r += rf.a * (r0 - r) * dt + sigma_r * Math.sqrt(dt) * dWr0;
-        logS +=
-          (rf.mu_fx - 0.5 * sigma_fx * sigma_fx) * dt +
-          sigma_fx * Math.sqrt(dt) * dWs0;
-        const S = Math.exp(logS);
+  const timeSteps = Math.max(4, cumBase.length);
+  const dt = horizonYears / timeSteps;
 
-        const hbar = hazLevel[i];
-        const logh =
-          Math.log(Math.max(1e-6, h)) +
-          rf.kappa_h * (Math.log(Math.max(1e-6, hbar)) - Math.log(Math.max(1e-6, h))) * dt +
-          sigma_h * Math.sqrt(dt) * dWh0;
-        h = Math.max(1e-6, Math.exp(logh));
+  // Apply spreadShock scaling to cumPD and extend to horizon
+  const cumPD: number[] = Array.from({ length: timeSteps }, (_, i) => {
+    const base = cumBase[Math.min(i, cumBase.length - 1)];
+    // scale and cap < 1
+    return Math.min(0.999, base * (1 + spreadShock));
+  });
 
-        // light re-pricing of trades
-        let stepExp = 0;
-        for (const tr of trades) {
-          const remY =
-            Math.max(
-              0,
-              (new Date(tr.maturity).getTime() - Date.now()) / (365 * 86400e3)
-            ) - i * dt;
-          const ccyAdj = tr.currency === "USD" ? 1 : S;
+  // Non-negative marginals
+  const margPD = cumPD.map((p, i) => (i === 0 ? p : Math.max(0, p - cumPD[i - 1])));
 
-          if (tr.tradeType === "IRS") {
-            const dv = dv01(tr.notional * ccyAdj, Math.max(0, remY));
-            stepExp += -dv * (r - r0); // PV up when rates fall
-          } else {
-            const rp = rpv01(tr.notional * ccyAdj, Math.max(0, remY));
-            const spread = 0.015 + spreadShock; // 150 bps proxy
-            stepExp += rp * (spread - lgd * h);
-          }
-        }
+  const lgd = credit.lgd ?? 1 - (credit.recoveryRate ?? 0.4);
 
-        // CSA → only positive exposure is collateralised
-        let pos = Math.max(0, stepExp - csa.threshold);
-        if (pos >= csa.mta) {
-          const rdn = sched.rounding || 0;
-          if (rdn > 0) pos = Math.ceil(pos / rdn) * rdn;
-        } else {
-          pos = 0;
-        }
-        pathExp[i] = pos;
+  /* ------------------ curves / discount / funding setup ---------------- */
+
+  const rOIS = Math.max(0, (csa.interestRate ?? 0.03) + rateShock);
+  const fundingSpread = 0.015 + spreadShock;
+  const rF = rOIS + fundingSpread;
+  const DF = (r: number, t: number) => Math.exp(-r * t);
+
+  /* ----------------------------- exposures ----------------------------- */
+
+  const baseSigma = 0.2 * (1 + volShock);
+  const fxAdj = (ccy: string) => (ccy === "USD" ? 1 : 1.1);
+  const notionalUSD = (t: Trade) => t.notional * fxAdj(t.currency);
+
+  const EPE = new Array(timeSteps).fill(0);
+  const ENE = new Array(timeSteps).fill(0);
+  const PFE = new Array(timeSteps).fill(0);
+  const IMt = new Array(timeSteps).fill(csa.independentAmount || 0);
+
+  const maturityIndex = (t: Trade) => {
+    const T =
+      (new Date(t.maturity).getTime() - Date.now()) / (365 * 86400e3);
+    // if maturity is in the past, index becomes -1 => no exposure
+    const idx = Math.floor(T / dt) - 1;
+    return clamp(isFinite(idx) ? idx : -1, -1, timeSteps - 1);
+  };
+
+  for (let pth = 0; pth < paths; pth++) {
+    const pathE: number[] = new Array(timeSteps).fill(0);
+
+    for (const trade of trades) {
+      const N = notionalUSD(trade);
+      const Tidx = maturityIndex(trade);
+      if (Tidx < 0) continue; // matured trades contribute nothing
+
+      const typeMult = trade.tradeType === "CDS" ? 1.4 : 1.0;
+
+      for (let i = 0; i <= Tidx; i++) {
+        const tau = (i + 1) * dt;
+        const shock = normal(rand) * baseSigma * Math.sqrt(tau);
+        pathE[i] += N * typeMult * shock; // +/- exposure
       }
+    }
 
-      // wrong-way: Gaussian copula with hazard shock
-      const u = 0.5 * (1 + erf(dWh0 / Math.SQRT2)); // ~U(0,1)
-      const uWW = rf.wwCorr * u + (1 - rf.wwCorr) * Math.random();
-
-      let tau = Infinity,
-        H = 0;
-      for (let i = 0; i < T; i++) {
-        H += hazLevel[i] * dt;
-        if (1 - Math.exp(-H) >= uWW) {
-          tau = (i + 1) * dt;
-          break;
-        }
+    // CSA: threshold/MTA/rounding; positive exposure only for EPE
+    for (let i = 0; i < timeSteps; i++) {
+      let pos = Math.max(0, pathE[i] - csa.threshold);
+      if (pos >= csa.mta) {
+        const r = sched.rounding || 0;
+        if (r > 0) pos = Math.ceil(pos / r) * r;
+      } else {
+        pos = 0;
       }
-
-      for (let i = 0; i < T; i++) {
-        const t = (i + 1) * dt;
-        const DF = Math.exp(-r0 * t);
-        if (t <= tau) {
-          EPE[i] += pathExp[i];
-          ENE[i] += -0.3 * pathExp[i]; // proxy negative exposure
-          PFE[i] += 1.5 * pathExp[i];
-        }
-      }
+      const neg = Math.min(0, pathE[i]); // ENE proxy, keep sign
+      EPE[i] += pos;
+      ENE[i] += neg;
+      PFE[i] += Math.max(pos * 1.5, 0);
     }
   }
 
-  const n = paths * 2; // twins
-  for (let i = 0; i < T; i++) {
-    EPE[i] /= n;
-    ENE[i] /= n;
-    PFE[i] /= n;
+  for (let i = 0; i < timeSteps; i++) {
+    EPE[i] /= paths;
+    ENE[i] /= paths;
+    PFE[i] /= paths;
   }
 
-  // Initial margin (proxy, vol-scaled)
+  // Simple IM (VaR-style) profile
   const avgNotional =
-    trades.reduce((s, t) => s + t.notional, 0) / Math.max(1, trades.length);
-  for (let i = 0; i < T; i++) {
+    trades.reduce((s, t) => s + notionalUSD(t), 0) /
+    Math.max(trades.length, 1);
+  for (let i = 0; i < timeSteps; i++) {
     IMt[i] = Math.max(
       csa.independentAmount || 0,
-      2.33 * sigma_fx * Math.sqrt((i + 1) * dt) * avgNotional * 0.2
+      2.33 * baseSigma * Math.sqrt((i + 1) * dt) * avgNotional * 0.2
     );
   }
 
-  // Valuation adjustments
+  // XVA components
   let CVA = 0,
     FVA = 0,
     MVA = 0;
-  for (let i = 0; i < T; i++) {
+  for (let i = 0; i < timeSteps; i++) {
     const t = (i + 1) * dt;
-    const DF = Math.exp(-r0 * t);
-    CVA += lgd * EPE[i] * margPD[i] * DF;
-    FVA += EPE[i] * 0.015 * dt * DF;
-    MVA += IMt[i] * 0.015 * dt * DF;
+    CVA += lgd * EPE[i] * margPD[i] * DF(rOIS, t);
+    FVA += EPE[i] * (rF - rOIS) * dt * DF(rOIS, t);
+    MVA += IMt[i] * (rF - rOIS) * dt * DF(rOIS, t);
   }
+  const KVA = reg.alphaFactor * reg.multiplier * 0.1 * CVA; // proxy KVA
 
-  // KVA will be computed outside with a capital proxy
   return {
     cva: Math.max(0, CVA),
     fva: Math.max(0, FVA),
     mva: Math.max(0, MVA),
-    kva: 0,
+    kva: Math.max(0, KVA),
     epe: EPE,
     ene: ENE,
     pfe: PFE,
   };
 }
 
-/* ---- Greeks with CRN ---- */
-type GreekSet = {
-  delta_bp: number;
-  gamma_bp2: number;
-  rho_bp: number;
-  vega_perc: number;
-  theta: number;
-};
-function computeGreeksWithCRN(core: Omit<
-  Parameters<typeof computeXVA>[0],
-  "rateShock" | "volShock" | "spreadShock" | "seed"
->): GreekSet {
-  const h_bp = 1e-4; // 1bp
-  const h_vol = 0.01; // +1% absolute vol
-
-  const seed = 42;
-  const base = computeXVA({ ...core, seed });
-
-  const upR = computeXVA({ ...core, seed, rateShock: +h_bp });
-  const dnR = computeXVA({ ...core, seed, rateShock: -h_bp });
-
-  const upV = computeXVA({ ...core, seed, volShock: +h_vol });
-  const dnV = computeXVA({ ...core, seed, volShock: -h_vol });
-
-  const Δ = centralDiff(upR.cva, dnR.cva, h_bp); // $ per 1.0 rate → per bp because h_bp is bp
-  const Γ = secondCentralDiff(upR.cva, base.cva, dnR.cva, h_bp);
-  const ρ = Δ;
-  const ν = centralDiff(upV.cva, dnV.cva, h_vol); // $ per +1.0 vol (100%)
-
-  return { delta_bp: Δ, gamma_bp2: Γ, rho_bp: ρ, vega_perc: ν, theta: 0 };
-}
-
-/* ---- KVA proxy from capital (SA-CVA-like) ---- */
-type Rating = "AAA" | "AA" | "A" | "BBB" | "BB" | "B" | "CCC";
-const ratingRW: Record<Rating, number> = {
-  AAA: 0.007,
-  AA: 0.01,
-  A: 0.012,
-  BBB: 0.02,
-  BB: 0.05,
-  B: 0.10,
-  CCC: 0.12,
-};
-function eepeFromProfile(EPE: number[]) {
-  return EPE.reduce((s, x) => s + x, 0) / Math.max(1, EPE.length);
-}
-function proxyKVA(
-  EPE: number[],
-  lgd: number,
-  maturityY: number,
-  rating: Rating,
-  costOfCapital = 0.10,
-  horizonY = 1
-) {
-  const ead = eepeFromProfile(EPE);
-  const rw = ratingRW[rating];
-  const capital = rw * lgd * ead * Math.sqrt(Math.max(0.5, maturityY));
-  return costOfCapital * capital * horizonY;
-}
-
-/* ------------------------------- UI ------------------------------ */
+/* ------------------------------- the app ------------------------------ */
 
 export default function App() {
-  // portfolio
-  const [trades] = useState<Trade[]>([
+  // sample portfolio
+  const [trades, setTrades] = useState<Trade[]>([
     {
       id: "TRD001",
       counterparty: "Goldman Sachs",
@@ -471,7 +307,7 @@ export default function App() {
     rounding: 10_000,
   });
   const [credit, setCredit] = useState<CreditData>({
-    pdCurve: "1,1.5,2,2.5,3",
+    pdCurve: "1,1.5,2,2.5,3", // (%)
     lgd: 0.6,
     recoveryRate: 0.4,
   });
@@ -485,52 +321,121 @@ export default function App() {
     rateShock: 0.01,
     volShock: 0.05,
     creditSpreadShock: 0.02,
-    correlationShock: 0.1, // placeholder in this version
+    correlationShock: 0.1,
   });
 
   const [res, setRes] = useState<XVAResults | null>(null);
   const [progress, setProgress] = useState(0);
   const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
 
-  async function calculateXVA() {
+  const calcGreeks = async () => {
     setBusy(true);
+    setErr(null);
+    setProgress(0);
+
     for (let i = 0; i <= 100; i += 10) {
       setProgress(i);
-      // tiny visual polish
-      // eslint-disable-next-line no-await-in-loop
       await new Promise((r) => setTimeout(r, 25));
     }
 
     const t0 = performance.now();
 
-    // Base run
-    const baseArgs = {
+    // Base
+    const base = computeXVA({
       trades,
       csa,
       sched,
       credit,
       reg,
       paths: 50_000,
-      rf: {},
-      horizonYears: 3,
-    } as const;
+      seed: 42,
+    });
 
-    const base = computeXVA({ ...baseArgs, seed: 42 });
+    // Delta (bump OIS level inside CSA quote rate)
+    const csaUp = { ...csa, interestRate: csa.interestRate + 0.0001 };
+    const csaDn = { ...csa, interestRate: csa.interestRate - 0.0001 };
+    const deltaUp = computeXVA({
+      trades,
+      csa: csaUp,
+      sched,
+      credit,
+      reg,
+      paths: 12_000,
+      seed: 1001,
+    });
+    const deltaDn = computeXVA({
+      trades,
+      csa: csaDn,
+      sched,
+      credit,
+      reg,
+      paths: 12_000,
+      seed: 1002,
+    });
+    const delta = (deltaUp.cva - deltaDn.cva) / 0.0002;
+    const gamma =
+      (deltaUp.cva - 2 * base.cva + deltaDn.cva) / Math.pow(0.0001, 2);
 
-    // Greeks with CRN (stable)
-    const greeks = computeGreeksWithCRN(baseArgs);
+    // Vega (2-sided)
+    const vUp = computeXVA({
+      trades,
+      csa,
+      sched,
+      credit,
+      reg,
+      paths: 12_000,
+      seed: 2001,
+      volShock: 0.01,
+    });
+    const vDn = computeXVA({
+      trades,
+      csa,
+      sched,
+      credit,
+      reg,
+      paths: 12_000,
+      seed: 2002,
+      volShock: -0.01,
+    });
+    const vega = (vUp.cva - vDn.cva) / 0.02;
 
-    // Scenario
+    // Rho (discount-only shock)
+    const rhoUp = computeXVA({
+      trades,
+      csa,
+      sched,
+      credit,
+      reg,
+      paths: 12_000,
+      seed: 3001,
+      rateShock: 0.0001,
+    });
+    const rhoDn = computeXVA({
+      trades,
+      csa,
+      sched,
+      credit,
+      reg,
+      paths: 12_000,
+      seed: 3002,
+      rateShock: -0.0001,
+    });
+    const rho = (rhoUp.cva - rhoDn.cva) / 0.0002;
+
+    // Scenario (user shocks)
     const shocked = computeXVA({
-      ...baseArgs,
+      trades,
+      csa,
+      sched,
+      credit,
+      reg,
+      paths: 20_000,
       seed: 1337,
       rateShock: sc.rateShock,
       volShock: sc.volShock,
       spreadShock: sc.creditSpreadShock,
     });
-
-    // KVA proxy (rating A, 10% CoC)
-    const kva = proxyKVA(base.epe, credit.lgd ?? 0.6, 3, "A", 0.10, 1);
 
     const ms = Math.round(Math.max(1, performance.now() - t0));
 
@@ -538,13 +443,13 @@ export default function App() {
       cva: Math.round(base.cva),
       fva: Math.round(base.fva),
       mva: Math.round(base.mva),
-      kva: Math.round(kva),
+      kva: Math.round(base.kva),
       cvaGreeks: {
-        delta: greeks.delta_bp,
-        gamma: greeks.gamma_bp2,
-        vega: greeks.vega_perc,
-        rho: greeks.rho_bp,
-        theta: 0,
+        delta,
+        gamma,
+        vega,
+        rho,
+        theta: 0, // left as 0; would require passage-of-time modeling
       },
       exposure: base.epe.map((epe, i) => ({
         date: new Date(Date.now() + (i + 1) * 30 * 86400e3)
@@ -558,6 +463,7 @@ export default function App() {
         baseCase: Math.round(base.cva),
         shockedCase: Math.round(shocked.cva),
         impact: Math.round(shocked.cva - base.cva),
+        // simple “display” VaR proxy; fine for demo
         var95: Math.round(base.cva * 1.44),
         var99: Math.round(base.cva * 1.76),
       },
@@ -566,16 +472,24 @@ export default function App() {
 
     setBusy(false);
     setProgress(0);
-  }
+  };
+
+  const setScenarioPreset = (preset: "Calm" | "Stressed" | "Severe") => {
+    if (preset === "Calm")
+      setSc({ rateShock: 0.002, volShock: 0.01, creditSpreadShock: 0.005, correlationShock: 0.05 });
+    if (preset === "Stressed")
+      setSc({ rateShock: 0.01, volShock: 0.05, creditSpreadShock: 0.02, correlationShock: 0.1 });
+    if (preset === "Severe")
+      setSc({ rateShock: 0.02, volShock: 0.1, creditSpreadShock: 0.05, correlationShock: 0.2 });
+  };
 
   const exportJSON = () => {
-    if (!res) return;
     const payload = {
       timestamp: new Date().toISOString(),
       inputs: { trades, csa, sched, credit, reg, scenario: sc },
       results: res,
       disclaimers:
-        "Educational XVA demo. Exposures are proxy-based; FVA/MVA use funding spread × EPE/IM; KVA is a capital proxy, not SA-CVA.",
+        "This is an educational XVA demo: exposures are proxy-based; FVA/MVA use funding spread * EPE/IM; KVA is a proportional proxy.",
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], {
       type: "application/json",
@@ -587,29 +501,7 @@ export default function App() {
     a.click();
   };
 
-  const setScenarioPreset = (p: "Calm" | "Stressed" | "Severe") => {
-    if (p === "Calm")
-      setSc({
-        rateShock: 0.002,
-        volShock: 0.01,
-        creditSpreadShock: 0.005,
-        correlationShock: 0.05,
-      });
-    if (p === "Stressed")
-      setSc({
-        rateShock: 0.01,
-        volShock: 0.05,
-        creditSpreadShock: 0.02,
-        correlationShock: 0.1,
-      });
-    if (p === "Severe")
-      setSc({
-        rateShock: 0.02,
-        volShock: 0.1,
-        creditSpreadShock: 0.05,
-        correlationShock: 0.2,
-      });
-  };
+  /* ------------------------------- UI --------------------------------- */
 
   return (
     <div
@@ -618,18 +510,12 @@ export default function App() {
         padding: 24,
         maxWidth: 1200,
         margin: "0 auto",
-        WebkitUserSelect: "none",
-        userSelect: "none",
       }}
     >
-      <style>{`
-        input, textarea, select { -webkit-user-select: text; user-select: text; }
-      `}</style>
-
       <h1 style={{ marginBottom: 8 }}>Enterprise XVA Engine</h1>
       <p style={{ marginTop: 0, color: "#555" }}>
-        Edit inputs → Calculate → view capital vs. P&amp;L trade-offs.
-        Greeks shown as Δ/ρ per 1bp, ν per +1.0 vol (100%), Γ per (bp)^2.
+        Edit inputs → Calculate → view capital vs. P&amp;L trade-offs. (KVA shown
+        as α × multiplier × 10% × CVA — display proxy.)
       </p>
 
       {/* Inputs */}
@@ -759,7 +645,7 @@ export default function App() {
 
       <div style={{ marginTop: 16, display: "flex", gap: 8, flexWrap: "wrap" }}>
         <button
-          onClick={calculateXVA}
+          onClick={calcGreeks}
           disabled={busy}
           style={{ padding: "10px 14px", fontWeight: 600 }}
         >
@@ -814,11 +700,14 @@ export default function App() {
                 </tr>
               </thead>
               <tbody>
-                <Row label="Δ (per 1bp)" value={res.cvaGreeks.delta} />
-                <Row label="Γ (per bp²)" value={res.cvaGreeks.gamma} />
-                <Row label="ν (per +1.0 vol)" value={res.cvaGreeks.vega} />
-                <Row label="ρ (per 1bp)" value={res.cvaGreeks.rho} />
-                <Row label="θ" value={res.cvaGreeks.theta} />
+                {Object.entries(res.cvaGreeks).map(([k, v]) => (
+                  <tr key={k}>
+                    <td style={{ padding: "6px 0" }}>{k.toUpperCase()}</td>
+                    <td style={{ padding: "6px 0", textAlign: "right" }}>
+                      {v.toFixed(4)}
+                    </td>
+                  </tr>
+                ))}
               </tbody>
             </table>
           </section>
@@ -882,7 +771,7 @@ export default function App() {
                 onChange={(v) => setSc({ ...sc, creditSpreadShock: v })}
               />
               <LabelNumber
-                label="Corr shock (placeholder)"
+                label="Corr shock"
                 step={0.001}
                 value={sc.correlationShock}
                 onChange={(v) => setSc({ ...sc, correlationShock: v })}
@@ -906,9 +795,7 @@ export default function App() {
                 <tr>
                   <td>CVA</td>
                   <td align="right">{fmtUSD(res.scenarioResults.baseCase)}</td>
-                  <td align="right">
-                    {fmtUSD(res.scenarioResults.shockedCase)}
-                  </td>
+                  <td align="right">{fmtUSD(res.scenarioResults.shockedCase)}</td>
                   <td
                     align="right"
                     style={{
@@ -958,22 +845,13 @@ export default function App() {
           </section>
         </>
       )}
+
+      {err && <p style={{ color: "#b00020" }}>{err}</p>}
     </div>
   );
 }
 
 /* --------------------------- tiny UI helpers -------------------------- */
-
-function Row({ label, value }: { label: string; value: number }) {
-  return (
-    <tr>
-      <td style={{ padding: "6px 0" }}>{label}</td>
-      <td style={{ padding: "6px 0", textAlign: "right" }}>
-        {Number.isFinite(value) ? value.toFixed(4) : "—"}
-      </td>
-    </tr>
-  );
-}
 
 function MiniCard({ title, value }: { title: string; value: string }) {
   return (
