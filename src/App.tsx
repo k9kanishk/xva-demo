@@ -40,17 +40,19 @@ const clamp = (x: number, lo: number, hi: number) =>
 // ---- helpers for Greek bumps ----
 function scalePDCurve(pdCurveStr: string, relBump: number): string {
   const xs = pdCurveStr.split(/[,\s]+/).filter(Boolean).map(Number);
-  return xs.map(x => x * (1 + relBump)).join(",");
+  return xs.map((x) => x * (1 + relBump)).join(",");
 }
-
 function centralDiff(fPlus: number, fMinus: number, h: number): number {
   return (fPlus - fMinus) / (2 * h);
 }
-
-function centralSecondDiff(fPlus: number, f0: number, fMinus: number, h: number): number {
+function centralSecondDiff(
+  fPlus: number,
+  f0: number,
+  fMinus: number,
+  h: number
+): number {
   return (fPlus - 2 * f0 + fMinus) / (h * h);
 }
-
 
 /* ------------------------------- types -------------------------------- */
 
@@ -153,33 +155,23 @@ function computeXVA(args: {
 
   /* --------- PD curve: robust normalization + monotone cumulative ------ */
 
-  // raw values user typed
   const rawPD = parseList(credit.pdCurve);
-
-  // If any entry > 1 we assume user typed percentages
   const pdAsDec =
     rawPD.some((v) => v > 1) ? rawPD.map((v) => v / 100) : rawPD.slice();
 
-  // Clamp to [0, 0.999] and build monotone cumulative curve
-  for (let i = 0; i < pdAsDec.length; i++) {
-    pdAsDec[i] = clamp(pdAsDec[i], 0, 0.999);
-  }
+  for (let i = 0; i < pdAsDec.length; i++) pdAsDec[i] = clamp(pdAsDec[i], 0, 0.999);
+
   const cumBase: number[] = new Array(pdAsDec.length);
-  for (let i = 0; i < pdAsDec.length; i++) {
+  for (let i = 0; i < pdAsDec.length; i++)
     cumBase[i] = i === 0 ? pdAsDec[0] : Math.max(pdAsDec[i], cumBase[i - 1]);
-  }
 
   const timeSteps = Math.max(4, cumBase.length);
   const dt = horizonYears / timeSteps;
 
-  // Apply spreadShock scaling to cumPD and extend to horizon
   const cumPD: number[] = Array.from({ length: timeSteps }, (_, i) => {
     const base = cumBase[Math.min(i, cumBase.length - 1)];
-    // scale and cap < 1
     return Math.min(0.999, base * (1 + spreadShock));
   });
-
-  // Non-negative marginals
   const margPD = cumPD.map((p, i) => (i === 0 ? p : Math.max(0, p - cumPD[i - 1])));
 
   const lgd = credit.lgd ?? 1 - (credit.recoveryRate ?? 0.4);
@@ -203,9 +195,7 @@ function computeXVA(args: {
   const IMt = new Array(timeSteps).fill(csa.independentAmount || 0);
 
   const maturityIndex = (t: Trade) => {
-    const T =
-      (new Date(t.maturity).getTime() - Date.now()) / (365 * 86400e3);
-    // if maturity is in the past, index becomes -1 => no exposure
+    const T = (new Date(t.maturity).getTime() - Date.now()) / (365 * 86400e3);
     const idx = Math.floor(T / dt) - 1;
     return clamp(isFinite(idx) ? idx : -1, -1, timeSteps - 1);
   };
@@ -216,18 +206,17 @@ function computeXVA(args: {
     for (const trade of trades) {
       const N = notionalUSD(trade);
       const Tidx = maturityIndex(trade);
-      if (Tidx < 0) continue; // matured trades contribute nothing
+      if (Tidx < 0) continue;
 
       const typeMult = trade.tradeType === "CDS" ? 1.4 : 1.0;
 
       for (let i = 0; i <= Tidx; i++) {
         const tau = (i + 1) * dt;
         const shock = normal(rand) * baseSigma * Math.sqrt(tau);
-        pathE[i] += N * typeMult * shock; // +/- exposure
+        pathE[i] += N * typeMult * shock;
       }
     }
 
-    // CSA: threshold/MTA/rounding; positive exposure only for EPE
     for (let i = 0; i < timeSteps; i++) {
       let pos = Math.max(0, pathE[i] - csa.threshold);
       if (pos >= csa.mta) {
@@ -236,7 +225,7 @@ function computeXVA(args: {
       } else {
         pos = 0;
       }
-      const neg = Math.min(0, pathE[i]); // ENE proxy, keep sign
+      const neg = Math.min(0, pathE[i]);
       EPE[i] += pos;
       ENE[i] += neg;
       PFE[i] += Math.max(pos * 1.5, 0);
@@ -249,10 +238,8 @@ function computeXVA(args: {
     PFE[i] /= paths;
   }
 
-  // Simple IM (VaR-style) profile
   const avgNotional =
-    trades.reduce((s, t) => s + notionalUSD(t), 0) /
-    Math.max(trades.length, 1);
+    trades.reduce((s, t) => s + notionalUSD(t), 0) / Math.max(trades.length, 1);
   for (let i = 0; i < timeSteps; i++) {
     IMt[i] = Math.max(
       csa.independentAmount || 0,
@@ -260,7 +247,6 @@ function computeXVA(args: {
     );
   }
 
-  // XVA components
   let CVA = 0,
     FVA = 0,
     MVA = 0;
@@ -270,7 +256,7 @@ function computeXVA(args: {
     FVA += EPE[i] * (rF - rOIS) * dt * DF(rOIS, t);
     MVA += IMt[i] * (rF - rOIS) * dt * DF(rOIS, t);
   }
-  const KVA = reg.alphaFactor * reg.multiplier * 0.1 * CVA; // proxy KVA
+  const KVA = reg.alphaFactor * reg.multiplier * 0.1 * CVA;
 
   return {
     cva: Math.max(0, CVA),
@@ -352,53 +338,119 @@ export default function App() {
 
     const t0 = performance.now();
 
-// Base run
-const base = computeXVA({
-  trades, csa, sched, credit, reg,
-  paths: 50_000, seed: 42
-});
+    // Base run
+    const base = computeXVA({
+      trades,
+      csa,
+      sched,
+      credit,
+      reg,
+      paths: 50_000,
+      seed: 42,
+    });
 
-// ---------- Greeks ----------
+    // ---------- Greeks ----------
 
-// 1) Spread-Delta & Gamma via PD relative scaling
-const epsPD = 0.01; // ±1% relative bump to PD curve
+    // 1) Spread-Delta & Gamma via PD relative scaling
+    const epsPD = 0.01;
 
-const creditPDp = { ...credit, pdCurve: scalePDCurve(credit.pdCurve, +epsPD) };
-const creditPDm = { ...credit, pdCurve: scalePDCurve(credit.pdCurve, -epsPD) };
+    const creditPDp = {
+      ...credit,
+      pdCurve: scalePDCurve(credit.pdCurve, +epsPD),
+    };
+    const creditPDm = {
+      ...credit,
+      pdCurve: scalePDCurve(credit.pdCurve, -epsPD),
+    };
 
-const cPDp = computeXVA({ trades, csa, sched, credit: creditPDp, reg, paths: 80_000, seed: 42 });
-const cPDm = computeXVA({ trades, csa, sched, credit: creditPDm, reg, paths: 80_000, seed: 42 });
+    const cPDp = computeXVA({
+      trades,
+      csa,
+      sched,
+      credit: creditPDp,
+      reg,
+      paths: 80_000,
+      seed: 42,
+    });
+    const cPDm = computeXVA({
+      trades,
+      csa,
+      sched,
+      credit: creditPDm,
+      reg,
+      paths: 80_000,
+      seed: 42,
+    });
 
-const delta = centralDiff(cPDp.cva, cPDm.cva, epsPD);                 // $ per 1.00 PD scaling
-const gamma = centralSecondDiff(cPDp.cva, base.cva, cPDm.cva, epsPD); // $ per (1.00)^2 PD scaling
+    const delta = centralDiff(cPDp.cva, cPDm.cva, epsPD);
+    const gamma = centralSecondDiff(cPDp.cva, base.cva, cPDm.cva, epsPD);
 
-// 2) Rho via OIS ±1bp
-const bp = 1e-4;
+    // 2) Rho via OIS ±1bp
+    const bp = 1e-4;
 
-const csaRp = { ...csa, interestRate: csa.interestRate + bp };
-const csaRm = { ...csa, interestRate: Math.max(0, csa.interestRate - bp) };
+    const csaRp = { ...csa, interestRate: csa.interestRate + bp };
+    const csaRm = { ...csa, interestRate: Math.max(0, csa.interestRate - bp) };
 
-const cRp = computeXVA({ trades, csa: csaRp, sched, credit, reg, paths: 80_000, seed: 42 });
-const cRm = computeXVA({ trades, csa: csaRm, sched, credit, reg, paths: 80_000, seed: 42 });
+    const cRp = computeXVA({
+      trades,
+      csa: csaRp,
+      sched,
+      credit,
+      reg,
+      paths: 80_000,
+      seed: 42,
+    });
+    const cRm = computeXVA({
+      trades,
+      csa: csaRm,
+      sched,
+      credit,
+      reg,
+      paths: 80_000,
+      seed: 42,
+    });
 
-const rho = centralDiff(cRp.cva, cRm.cva, bp); // $ per 1.0 rate change
-const rho_per_bp = rho * 1e-4;                // present as $ / bp
+    const rho = centralDiff(cRp.cva, cRm.cva, bp);
+    const rho_per_bp = rho * 1e-4;
 
-// 3) Vega via sigma ±1%
-const epsVol = 0.01;
-const vegaPlus  = computeXVA({ trades, csa, sched, credit, reg, paths: 80_000, seed: 42, volShock: +epsVol });
-const vegaMinus = computeXVA({ trades, csa, sched, credit, reg, paths: 80_000, seed: 42, volShock: -epsVol });
+    // 3) Vega via sigma ±1%
+    const epsVol = 0.01;
+    const vegaPlus = computeXVA({
+      trades,
+      csa,
+      sched,
+      credit,
+      reg,
+      paths: 80_000,
+      seed: 42,
+      volShock: +epsVol,
+    });
+    const vegaMinus = computeXVA({
+      trades,
+      csa,
+      sched,
+      credit,
+      reg,
+      paths: 80_000,
+      seed: 42,
+      volShock: -epsVol,
+    });
 
-const vega = centralDiff(vegaPlus.cva, vegaMinus.cva, epsVol); // $ per 1.0 sigma scaling
+    const vega = centralDiff(vegaPlus.cva, vegaMinus.cva, epsVol);
 
-// 4) Theta: roll 1 day (approx). If your computeXVA supports horizonYears:
-const day = 1 / 252;
-const thetaForward = computeXVA({
-  trades, csa, sched, credit, reg,
-  paths: 80_000, seed: 42,
-  horizonYears: 3 - day // if computeXVA has this param
-});
-const theta = (thetaForward.cva - base.cva) / day; // $ per year
+    // 4) Theta: roll 1 day (approx)
+    const day = 1 / 252;
+    const thetaForward = computeXVA({
+      trades,
+      csa,
+      sched,
+      credit,
+      reg,
+      paths: 80_000,
+      seed: 42,
+      horizonYears: 3 - day,
+    });
+    const theta = (thetaForward.cva - base.cva) / day;
 
     // Scenario (user shocks)
     const shocked = computeXVA({
@@ -414,56 +466,71 @@ const theta = (thetaForward.cva - base.cva) / day; // $ per year
       spreadShock: sc.creditSpreadShock,
     });
 
-    const ms = Math.round(Math.max(1, performance.now() - t0));
-
     setRes({
-  cva: Math.round(base.cva),
-  fva: Math.round(base.fva),
-  mva: Math.round(base.mva),
-  kva: Math.round(base.kva),
-  cvaGreeks: {
-    // Present them in intuitive units:
-    // - Delta: $ per 1% PD scaling
-    // - Gamma: $ per (1% PD)^2
-    // - Vega:  $ per 1% vol
-    // - Rho:   $ per 1 bp OIS
-    // - Theta: $ per day (convert per-year by /252)
-    delta: +((delta / 0.01)).toFixed(2),
-    gamma: +((gamma / (0.01 * 0.01))).toFixed(2),
-    vega:  +((vega  / 0.01)).toFixed(2),
-    rho:   +(rho_per_bp).toFixed(2),
-    theta: +((theta / 252)).toFixed(2)
-  },
-  exposure: base.epe.map((epe, i) => ({
-    date: new Date(Date.now() + (i + 1) * 30 * 86400e3).toISOString().slice(0, 10),
-    epe: Math.round(epe),
-    ene: Math.round(base.ene[i]),
-    pfe: Math.round(base.pfe[i])
-  })),
-  scenarioResults: {
-    baseCase: Math.round(base.cva),
-    shockedCase: Math.round(cPDp.cva),
-    impact: Math.round(cPDp.cva - base.cva),
-    var95: Math.round(base.cva * 1.44),
-    var99: Math.round(base.cva * 1.76)
-  },
-  performance: {
-    calculationTime: Math.round(Math.max(1, performance.now() - t0)),
-    paths: 50_000,
-    gpuUsed: true
-  }
-});
+      cva: Math.round(base.cva),
+      fva: Math.round(base.fva),
+      mva: Math.round(base.mva),
+      kva: Math.round(base.kva),
+      cvaGreeks: {
+        // Present in intuitive units
+        delta: +((delta / 0.01)).toFixed(2), // $ per 1% PD scaling
+        gamma: +((gamma / (0.01 * 0.01))).toFixed(2), // $ per (1% PD)^2
+        vega: +((vega / 0.01)).toFixed(2), // $ per 1% vol
+        rho: +(rho_per_bp).toFixed(2), // $ per 1 bp OIS
+        theta: +((theta / 252)).toFixed(2), // $ per day
+      },
+      exposure: base.epe.map((epe, i) => ({
+        date: new Date(Date.now() + (i + 1) * 30 * 86400e3)
+          .toISOString()
+          .slice(0, 10),
+        epe: Math.round(epe),
+        ene: Math.round(base.ene[i]),
+        pfe: Math.round(base.pfe[i]),
+      })),
+      scenarioResults: {
+        baseCase: Math.round(base.cva),
+        shockedCase: Math.round(cPDp.cva),
+        impact: Math.round(cPDp.cva - base.cva),
+        var95: Math.round(base.cva * 1.44),
+        var99: Math.round(base.cva * 1.76),
+      },
+      performance: {
+        calculationTime: Math.round(Math.max(1, performance.now() - t0)),
+        paths: 50_000,
+        gpuUsed: true,
+      },
+    });
 
+    setBusy(false);
+    setProgress(0);
+  }; // <-- properly closes calcGreeks
 
+  // Preset scenarios (OUTSIDE calcGreeks)
   const setScenarioPreset = (preset: "Calm" | "Stressed" | "Severe") => {
     if (preset === "Calm")
-      setSc({ rateShock: 0.002, volShock: 0.01, creditSpreadShock: 0.005, correlationShock: 0.05 });
+      setSc({
+        rateShock: 0.002,
+        volShock: 0.01,
+        creditSpreadShock: 0.005,
+        correlationShock: 0.05,
+      });
     if (preset === "Stressed")
-      setSc({ rateShock: 0.01, volShock: 0.05, creditSpreadShock: 0.02, correlationShock: 0.1 });
+      setSc({
+        rateShock: 0.01,
+        volShock: 0.05,
+        creditSpreadShock: 0.02,
+        correlationShock: 0.1,
+      });
     if (preset === "Severe")
-      setSc({ rateShock: 0.02, volShock: 0.1, creditSpreadShock: 0.05, correlationShock: 0.2 });
+      setSc({
+        rateShock: 0.02,
+        volShock: 0.1,
+        creditSpreadShock: 0.05,
+        correlationShock: 0.2,
+      });
   };
 
+  // Export JSON (OUTSIDE calcGreeks)
   const exportJSON = () => {
     const payload = {
       timestamp: new Date().toISOString(),
@@ -830,7 +897,14 @@ const theta = (thetaForward.cva - base.cva) / day; // $ per year
 
 function MiniCard({ title, value }: { title: string; value: string }) {
   return (
-    <div style={{ padding: 12, border: "1px solid #eee", borderRadius: 8, background: "#fff" }}>
+    <div
+      style={{
+        padding: 12,
+        border: "1px solid #eee",
+        borderRadius: 8,
+        background: "#fff",
+      }}
+    >
       <div style={{ fontSize: 12, color: "#666" }}>{title}</div>
       <div style={{ fontSize: 20, fontWeight: 700 }}>{value}</div>
     </div>
@@ -838,11 +912,21 @@ function MiniCard({ title, value }: { title: string; value: string }) {
 }
 
 function LabelNumber({
-  label, value, onChange, step = 1,
-}: { label: string; value: number; onChange: (v: number) => void; step?: number }) {
+  label,
+  value,
+  onChange,
+  step = 1,
+}: {
+  label: string;
+  value: number;
+  onChange: (v: number) => void;
+  step?: number;
+}) {
   return (
     <div style={{ margin: "6px 0" }}>
-      <label style={{ display: "block", fontSize: 12, color: "#555" }}>{label}</label>
+      <label style={{ display: "block", fontSize: 12, color: "#555" }}>
+        {label}
+      </label>
       <input
         type="number"
         step={step}
@@ -855,13 +939,31 @@ function LabelNumber({
 }
 
 function LabelSelect({
-  label, value, options, onChange,
-}: { label: string; value: string; options: string[]; onChange: (v: string) => void }) {
+  label,
+  value,
+  options,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  options: string[];
+  onChange: (v: string) => void;
+}) {
   return (
     <div style={{ margin: "6px 0" }}>
-      <label style={{ display: "block", fontSize: 12, color: "#555" }}>{label}</label>
-      <select value={value} onChange={(e) => onChange(e.target.value)} style={{ width: "100%" }}>
-        {options.map(o => <option key={o} value={o}>{o}</option>)}
+      <label style={{ display: "block", fontSize: 12, color: "#555" }}>
+        {label}
+      </label>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        style={{ width: "100%" }}
+      >
+        {options.map((o) => (
+          <option key={o} value={o}>
+            {o}
+          </option>
+        ))}
       </select>
     </div>
   );
