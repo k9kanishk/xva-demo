@@ -398,8 +398,7 @@ export default function App() {
   }
 
   // -------- main calc ----------
-  - const calcGreeks = async () => {
-+ const calcGreeks = async (scenarioOverride?: ScenarioParameters) => {
+   const calcGreeks = async (scenarioOverride?: ScenarioParameters) => {
     setBusy(true);
     setErr(null);
     setProgress(0);
