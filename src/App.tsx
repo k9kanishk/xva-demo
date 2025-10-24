@@ -196,9 +196,7 @@ function computeXVA(args: {
   // --- Hazard (from PD curve string) -----------------------------------
   // Normalize user PDs (accepts % or decimals), create hazard & default density
   const pdCum = normalizeCumPD(credit.pdCurve);
-  // Map the user's PD points onto our number of time steps by stretching/compressing
-  const timeSteps = Math.max(4, pdCum.length);
-  const dt = horizonYears / timeSteps;
+ 
 
   const { dPD } = hazardFromCumPD(pdCum, dt);
 
