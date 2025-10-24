@@ -1,5 +1,16 @@
 import { CurvePt, makeFlatCurve, df as dfCurve, fwd as fwdCurve } from "./engine/curves";
 import { normalizeCumPD, hazardFromCumPD } from "./engine/hazards";
+import { validateInputs } from "./engine/validators"; // or same file
+
+const { ok, errors } = validateInputs({ csa, sched, credit, reg });
+
+<button onClick={calcGreeks} disabled={busy || !ok}>…</button>
+
+{!ok && (
+  <div style={{marginTop:8, color:"#b00020"}}>
+    {errors.map((e,i)=><div key={i}>• {e}</div>)}
+  </div>
+)}
 
 
 import { useEffect, useState } from "react";
