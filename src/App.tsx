@@ -425,13 +425,12 @@ export default function App() {
     });
 
     // ---------- Greeks ----------
+// ---------- Greeks ----------
 const N = 80_000;
 const SEED = 42;
 
-// Base run must also use { paths: N, seed: SEED }
-
-    // 1) Spread-Delta & Gamma via PD relative scaling
-    const epsPD = 0.01;
+// 1) Spread-Delta & Gamma via PD relative scaling (±1%)
+const epsPD = 0.01;
 
 const creditPDp = { ...credit, pdCurve: scalePDCurve(credit.pdCurve, +epsPD) };
 const creditPDm = { ...credit, pdCurve: scalePDCurve(credit.pdCurve, -epsPD) };
@@ -439,83 +438,82 @@ const creditPDm = { ...credit, pdCurve: scalePDCurve(credit.pdCurve, -epsPD) };
 const cPDp = computeXVA({ trades, csa, sched, credit: creditPDp, reg, paths: N, seed: SEED });
 const cPDm = computeXVA({ trades, csa, sched, credit: creditPDm, reg, paths: N, seed: SEED });
 
-const delta = centralDiff(cPDp.cva, cPDm.cva, epsPD);          // $ per 1.00 (=100%) PD-scale change
+const delta = centralDiff(cPDp.cva, cPDm.cva, epsPD);                 // $ per 1.00 (100%) PD-scale change
 const gamma = centralSecondDiff(cPDp.cva, base.cva, cPDm.cva, epsPD); // $ per (1.00)^2
 
-    // centralDiff(...) already gave $ per 1.00 (100%) change
-const delta_per_1pct = delta * 0.01;            // ✅ $ per 1% PD scaling
-const gamma_per_1pct2 = gamma * (0.01 * 0.01);  // ✅ $ per (1% PD)^2
-const vega_per_1pct = vega * 0.01;              // ✅ $ per 1% vol
-const rho_per_bp = rho * 1e-4;                  // ✅ $ per 1 bp
-const theta_per_day = theta / 252;              // ✅ $ per day (you already do this downstream)
+// 2) Rho via OIS ±1bp
+const bp = 1e-4;
+const csaRp = { ...csa, interestRate: csa.interestRate + bp };
+const csaRm = { ...csa, interestRate: Math.max(0, csa.interestRate - bp) };
 
+const cRp = computeXVA({ trades, csa: csaRp, sched, credit, reg, paths: N, seed: SEED });
+const cRm = computeXVA({ trades, csa: csaRm, sched, credit, reg, paths: N, seed: SEED });
 
-    // 2) Rho via OIS ±1bp
-    const bp = 1e-4;
+const rho = centralDiff(cRp.cva, cRm.cva, bp);                        // $ per 1.00 (=100%) rate change
 
-    const csaRp = { ...csa, interestRate: csa.interestRate + bp };
-    const csaRm = { ...csa, interestRate: Math.max(0, csa.interestRate - bp) };
+// 3) Vega via sigma ±1%
+const epsVol = 0.01;
+const vegaPlus  = computeXVA({ trades, csa, sched, credit, reg, paths: N, seed: SEED, volShock: +epsVol });
+const vegaMinus = computeXVA({ trades, csa, sched, credit, reg, paths: N, seed: SEED, volShock: -epsVol });
 
-    const cRp = computeXVA({
-      trades,
-      csa: csaRp,
-      sched,
-      credit,
-      reg,
-      paths: 80_000,
-      seed: 42,
-    });
-    const cRm = computeXVA({
-      trades,
-      csa: csaRm,
-      sched,
-      credit,
-      reg,
-      paths: 80_000,
-      seed: 42,
-    });
+const vega = centralDiff(vegaPlus.cva, vegaMinus.cva, epsVol);        // $ per 1.00 (=100%) vol change
 
-    const rho = centralDiff(cRp.cva, cRm.cva, bp);
-    const rho_per_bp = rho * 1e-4;
+// 4) Theta: roll 1 trading day
+const day = 1 / 252;
+const thetaForward = computeXVA({ trades, csa, sched, credit, reg, paths: N, seed: SEED, horizonYears: 3 - day });
+const theta = (thetaForward.cva - base.cva) / day;                    // $ per year
 
-    // 3) Vega via sigma ±1%
-    const epsVol = 0.01;
-    const vegaPlus = computeXVA({
-      trades,
-      csa,
-      sched,
-      credit,
-      reg,
-      paths: 80_000,
-      seed: 42,
-      volShock: +epsVol,
-    });
-    const vegaMinus = computeXVA({
-      trades,
-      csa,
-      sched,
-      credit,
-      reg,
-      paths: 80_000,
-      seed: 42,
-      volShock: -epsVol,
-    });
+// ---- Convert to display units (do this ONCE; don't redeclare elsewhere) ----
+const delta_per_1pct   = delta * 0.01;            // $ per 1% PD scaling
+const gamma_per_1pct2  = gamma * (0.01 * 0.01);   // $ per (1% PD)^2
+const vega_per_1pct    = vega * 0.01;             // $ per 1% vol
+const rho_per_bp       = rho * 1e-4;              // $ per 1 bp
+const theta_per_day    = theta / 252;             // $ per day
+// ---------- Greeks ----------
+const N = 80_000;
+const SEED = 42;
 
-    const vega = centralDiff(vegaPlus.cva, vegaMinus.cva, epsVol);
+// 1) Spread-Delta & Gamma via PD relative scaling (±1%)
+const epsPD = 0.01;
 
-    // 4) Theta: roll 1 day (approx)
-    const day = 1 / 252;
-    const thetaForward = computeXVA({
-      trades,
-      csa,
-      sched,
-      credit,
-      reg,
-      paths: 80_000,
-      seed: 42,
-      horizonYears: 3 - day,
-    });
-    const theta = (thetaForward.cva - base.cva) / day;
+const creditPDp = { ...credit, pdCurve: scalePDCurve(credit.pdCurve, +epsPD) };
+const creditPDm = { ...credit, pdCurve: scalePDCurve(credit.pdCurve, -epsPD) };
+
+const cPDp = computeXVA({ trades, csa, sched, credit: creditPDp, reg, paths: N, seed: SEED });
+const cPDm = computeXVA({ trades, csa, sched, credit: creditPDm, reg, paths: N, seed: SEED });
+
+const delta = centralDiff(cPDp.cva, cPDm.cva, epsPD);                 // $ per 1.00 (100%) PD-scale change
+const gamma = centralSecondDiff(cPDp.cva, base.cva, cPDm.cva, epsPD); // $ per (1.00)^2
+
+// 2) Rho via OIS ±1bp
+const bp = 1e-4;
+const csaRp = { ...csa, interestRate: csa.interestRate + bp };
+const csaRm = { ...csa, interestRate: Math.max(0, csa.interestRate - bp) };
+
+const cRp = computeXVA({ trades, csa: csaRp, sched, credit, reg, paths: N, seed: SEED });
+const cRm = computeXVA({ trades, csa: csaRm, sched, credit, reg, paths: N, seed: SEED });
+
+const rho = centralDiff(cRp.cva, cRm.cva, bp);                        // $ per 1.00 (=100%) rate change
+
+// 3) Vega via sigma ±1%
+const epsVol = 0.01;
+const vegaPlus  = computeXVA({ trades, csa, sched, credit, reg, paths: N, seed: SEED, volShock: +epsVol });
+const vegaMinus = computeXVA({ trades, csa, sched, credit, reg, paths: N, seed: SEED, volShock: -epsVol });
+
+const vega = centralDiff(vegaPlus.cva, vegaMinus.cva, epsVol);        // $ per 1.00 (=100%) vol change
+
+// 4) Theta: roll 1 trading day
+const day = 1 / 252;
+const thetaForward = computeXVA({ trades, csa, sched, credit, reg, paths: N, seed: SEED, horizonYears: 3 - day });
+const theta = (thetaForward.cva - base.cva) / day;                    // $ per year
+
+// ---- Convert to display units (do this ONCE; don't redeclare elsewhere) ----
+const delta_per_1pct   = delta * 0.01;            // $ per 1% PD scaling
+const gamma_per_1pct2  = gamma * (0.01 * 0.01);   // $ per (1% PD)^2
+const vega_per_1pct    = vega * 0.01;             // $ per 1% vol
+const rho_per_bp       = rho * 1e-4;              // $ per 1 bp
+const theta_per_day    = theta / 252;             // $ per day
+
 
     // Scenario (user shocks)
     const shocked = computeXVA({
