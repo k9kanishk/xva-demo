@@ -12,6 +12,59 @@ const { ok, errors } = validateInputs({ csa, sched, credit, reg });
   </div>
 )}
 
+const { readInitial } = useUrlState({ csa, sched, credit, reg, sc });
+
+// on init, hydrate state from URL if present
+useEffect(() => {
+  const init = readInitial({ csa, sched, credit, reg, sc });
+  setCsa(init.csa ?? csa);
+  setSched(init.sched ?? sched);
+  setCredit(init.credit ?? credit);
+  setReg(init.reg ?? reg);
+  setSc(init.sc ?? sc);
+  // eslint-disable-next-line
+}, []);
+
+const baseDefaults = { csa: { ...csa }, sched: { ...sched }, credit: { ...credit }, reg: { ...reg }, sc: { ...sc } };
+
+function resetToBase() {
+  setCsa({ threshold: 1_000_000, mta: 100_000, interestRate: 0.05, currency: "USD", independentAmount: 500_000 });
+  setSched({ frequency:"daily", haircut:0.02, marginType:"variation", rounding:10_000 });
+  setCredit({ pdCurve:"1,1.5,2,2.5,3", lgd:0.6, recoveryRate:0.4 });
+  setReg({ alphaFactor:1.4, multiplier:1.0 });
+  setSc({ rateShock:0.01, volShock:0.05, creditSpreadShock:0.02, correlationShock:0.1 });
+}
+
+function cloneAsShocked() {
+  // take current base numbers and apply your sc to produce a quick shocked set, then run calc
+  calcGreeks();
+}
+<button onClick={resetToBase}>Reset</button>
+<button onClick={cloneAsShocked}>Clone as shocked</button>
+
+function importJSON(file: File) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const data = JSON.parse(String(reader.result));
+      if (data?.inputs) {
+        setCsa(data.inputs.csa);
+        setSched(data.inputs.sched);
+        setCredit(data.inputs.credit);
+        setReg(data.inputs.reg);
+        setSc(data.inputs.scenario);
+      }
+      if (data?.results) setRes(data.results);
+    } catch (e) { alert("Invalid JSON"); }
+  };
+  reader.readAsText(file);
+}
+
+<label style={{cursor:"pointer"}}>
+  Import JSON
+  <input type="file" accept="application/json" onChange={e => e.target.files?.[0] && importJSON(e.target.files[0])} style={{display:"none"}} />
+</label>
+
 
 import { useEffect, useState } from "react";
 import {
