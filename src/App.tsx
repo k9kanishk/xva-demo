@@ -425,40 +425,30 @@ export default function App() {
     });
 
     // ---------- Greeks ----------
+const N = 80_000;
+const SEED = 42;
+
+// Base run must also use { paths: N, seed: SEED }
 
     // 1) Spread-Delta & Gamma via PD relative scaling
     const epsPD = 0.01;
 
-    const creditPDp = {
-      ...credit,
-      pdCurve: scalePDCurve(credit.pdCurve, +epsPD),
-    };
-    const creditPDm = {
-      ...credit,
-      pdCurve: scalePDCurve(credit.pdCurve, -epsPD),
-    };
+const creditPDp = { ...credit, pdCurve: scalePDCurve(credit.pdCurve, +epsPD) };
+const creditPDm = { ...credit, pdCurve: scalePDCurve(credit.pdCurve, -epsPD) };
 
-    const cPDp = computeXVA({
-      trades,
-      csa,
-      sched,
-      credit: creditPDp,
-      reg,
-      paths: 80_000,
-      seed: 42,
-    });
-    const cPDm = computeXVA({
-      trades,
-      csa,
-      sched,
-      credit: creditPDm,
-      reg,
-      paths: 80_000,
-      seed: 42,
-    });
+const cPDp = computeXVA({ trades, csa, sched, credit: creditPDp, reg, paths: N, seed: SEED });
+const cPDm = computeXVA({ trades, csa, sched, credit: creditPDm, reg, paths: N, seed: SEED });
 
-    const delta = centralDiff(cPDp.cva, cPDm.cva, epsPD);
-    const gamma = centralSecondDiff(cPDp.cva, base.cva, cPDm.cva, epsPD);
+const delta = centralDiff(cPDp.cva, cPDm.cva, epsPD);          // $ per 1.00 (=100%) PD-scale change
+const gamma = centralSecondDiff(cPDp.cva, base.cva, cPDm.cva, epsPD); // $ per (1.00)^2
+
+    // centralDiff(...) already gave $ per 1.00 (100%) change
+const delta_per_1pct = delta * 0.01;            // ✅ $ per 1% PD scaling
+const gamma_per_1pct2 = gamma * (0.01 * 0.01);  // ✅ $ per (1% PD)^2
+const vega_per_1pct = vega * 0.01;              // ✅ $ per 1% vol
+const rho_per_bp = rho * 1e-4;                  // ✅ $ per 1 bp
+const theta_per_day = theta / 252;              // ✅ $ per day (you already do this downstream)
+
 
     // 2) Rho via OIS ±1bp
     const bp = 1e-4;
@@ -547,13 +537,13 @@ export default function App() {
       mva: Math.round(base.mva),
       kva: Math.round(base.kva),
       cvaGreeks: {
-        // Present in intuitive units
-        delta: +((delta / 0.01)).toFixed(2), // $ per 1% PD scaling
-        gamma: +((gamma / (0.01 * 0.01))).toFixed(2), // $ per (1% PD)^2
-        vega: +((vega / 0.01)).toFixed(2), // $ per 1% vol
-        rho: +(rho_per_bp).toFixed(2), // $ per 1 bp OIS
-        theta: +((theta / 252)).toFixed(2), // $ per day
-      },
+  delta: +delta_per_1pct.toFixed(2),
+  gamma: +gamma_per_1pct2.toFixed(2),
+  vega:  +vega_per_1pct.toFixed(2),
+  rho:   +rho_per_bp.toFixed(4),
+  theta: +theta_per_day.toFixed(2),
+},
+
       exposure: base.epe.map((epe, i) => ({
         date: new Date(Date.now() + (i + 1) * 30 * 86400e3)
           .toISOString()
