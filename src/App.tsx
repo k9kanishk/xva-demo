@@ -376,9 +376,6 @@ export default function App() {
     setSc({ rateShock: 0.01, volShock: 0.05, creditSpreadShock: 0.02, correlationShock: 0.1 });
   }
 
-  function cloneAsShocked() {
-    calcGreeks(); // re-run with current scenario shocks
-  }
 
   function importJSON(file: File) {
     const reader = new FileReader();
@@ -401,7 +398,8 @@ export default function App() {
   }
 
   // -------- main calc ----------
-  const calcGreeks = async () => {
+  - const calcGreeks = async () => {
++ const calcGreeks = async (scenarioOverride?: ScenarioParameters) => {
     setBusy(true);
     setErr(null);
     setProgress(0);
@@ -412,7 +410,23 @@ export default function App() {
     }
 
     const t0 = performance.now();
-
+-   const shocked = computeXVA({
++   const scen = scenarioOverride ?? sc;   // <— use latest value if provided
++   const shocked = computeXVA({
+      trades,
+      csa,
+      sched,
+      credit,
+      reg,
+      paths: 20_000,
+      seed: 1337,
+-     rateShock: sc.rateShock,
+-     volShock: sc.volShock,
+-     spreadShock: sc.creditSpreadShock,
++     rateShock: scen.rateShock,
++     volShock: scen.volShock,
++     spreadShock: scen.creditSpreadShock,
+    });
     // Base run
     const base = computeXVA({
       trades,
@@ -527,14 +541,18 @@ const theta_per_day    = theta / 252;             // $ per day
   // Preset scenarios
   const setScenarioPreset = (preset: "Calm" | "Stressed" | "Severe") => {
   let next: ScenarioParameters = sc;
-  if (preset === "Calm") next = { rateShock: 0.002, volShock: 0.01, creditSpreadShock: 0.005, correlationShock: 0.05 };
-  if (preset === "Stressed") next = { rateShock: 0.01, volShock: 0.05, creditSpreadShock: 0.02, correlationShock: 0.1 };
-  if (preset === "Severe") next = { rateShock: 0.02, volShock: 0.1, creditSpreadShock: 0.05, correlationShock: 0.2 };
+  if (preset === "Calm")
+    next = { rateShock: 0.002, volShock: 0.01, creditSpreadShock: 0.005, correlationShock: 0.05 };
+  if (preset === "Stressed")
+    next = { rateShock: 0.01,  volShock: 0.05, creditSpreadShock: 0.02,  correlationShock: 0.1  };
+  if (preset === "Severe")
+    next = { rateShock: 0.02,  volShock: 0.10, creditSpreadShock: 0.05,  correlationShock: 0.2  };
 
-  setSc(next);
-  // Re-run using the updated shocks
-  setTimeout(() => calcGreeks(), 0);
+  setSc(next);            // update UI fields
+- setTimeout(() => calcGreeks(), 0);
++ calcGreeks(next);       // compute with the *new* scenario now
 };
+
 
   // Export JSON
   const exportJSON = () => {
@@ -698,7 +716,7 @@ const theta_per_day    = theta / 252;             // $ per day
         </button>
 
         <button onClick={resetToBase}>Reset</button>
-        <button onClick={cloneAsShocked}>Clone as shocked</button>
+       
 
         <label style={{ cursor: "pointer" }}>
           Import JSON
