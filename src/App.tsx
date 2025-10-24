@@ -410,9 +410,8 @@ export default function App() {
     }
 
     const t0 = performance.now();
--   const shocked = computeXVA({
-+   const scen = scenarioOverride ?? sc;   // <— use latest value if provided
-+   const shocked = computeXVA({
+    const scen = scenarioOverride ?? sc;   // <— use latest value if provided
+    const shocked = computeXVA({
       trades,
       csa,
       sched,
@@ -420,12 +419,10 @@ export default function App() {
       reg,
       paths: 20_000,
       seed: 1337,
--     rateShock: sc.rateShock,
--     volShock: sc.volShock,
--     spreadShock: sc.creditSpreadShock,
-+     rateShock: scen.rateShock,
-+     volShock: scen.volShock,
-+     spreadShock: scen.creditSpreadShock,
+
+      rateShock: scen.rateShock,
+      volShock: scen.volShock,
+      spreadShock: scen.creditSpreadShock,
     });
     // Base run
     const base = computeXVA({
@@ -549,8 +546,7 @@ const theta_per_day    = theta / 252;             // $ per day
     next = { rateShock: 0.02,  volShock: 0.10, creditSpreadShock: 0.05,  correlationShock: 0.2  };
 
   setSc(next);            // update UI fields
-- setTimeout(() => calcGreeks(), 0);
-+ calcGreeks(next);       // compute with the *new* scenario now
+  calcGreeks(next);       // compute with the *new* scenario now
 };
 
 
