@@ -563,12 +563,13 @@ export default function App() {
         pfe: Math.round(base.pfe[i]),
       })),
       scenarioResults: {
-        baseCase: Math.round(base.cva),
-        shockedCase: Math.round(cPDp.cva),
-        impact: Math.round(cPDp.cva - base.cva),
-        var95: Math.round(base.cva * 1.44),
-        var99: Math.round(base.cva * 1.76),
-      },
+  baseCase: Math.round(base.cva),
+  shockedCase: Math.round(shocked.cva),          // ✅ use scenario shocks
+  impact: Math.round(shocked.cva - base.cva),    // ✅ difference vs base
+  var95: Math.round(base.cva * 1.44),
+  var99: Math.round(base.cva * 1.76),
+},
+
       performance: {
         calculationTime: Math.round(Math.max(1, performance.now() - t0)),
         paths: 50_000,
@@ -582,28 +583,15 @@ export default function App() {
 
   // Preset scenarios
   const setScenarioPreset = (preset: "Calm" | "Stressed" | "Severe") => {
-    if (preset === "Calm")
-      setSc({
-        rateShock: 0.002,
-        volShock: 0.01,
-        creditSpreadShock: 0.005,
-        correlationShock: 0.05,
-      });
-    if (preset === "Stressed")
-      setSc({
-        rateShock: 0.01,
-        volShock: 0.05,
-        creditSpreadShock: 0.02,
-        correlationShock: 0.1,
-      });
-    if (preset === "Severe")
-      setSc({
-        rateShock: 0.02,
-        volShock: 0.1,
-        creditSpreadShock: 0.05,
-        correlationShock: 0.2,
-      });
-  };
+  let next: ScenarioParameters = sc;
+  if (preset === "Calm") next = { rateShock: 0.002, volShock: 0.01, creditSpreadShock: 0.005, correlationShock: 0.05 };
+  if (preset === "Stressed") next = { rateShock: 0.01, volShock: 0.05, creditSpreadShock: 0.02, correlationShock: 0.1 };
+  if (preset === "Severe") next = { rateShock: 0.02, volShock: 0.1, creditSpreadShock: 0.05, correlationShock: 0.2 };
+
+  setSc(next);
+  // Re-run using the updated shocks
+  setTimeout(() => calcGreeks(), 0);
+};
 
   // Export JSON
   const exportJSON = () => {
