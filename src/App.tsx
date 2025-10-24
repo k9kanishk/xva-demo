@@ -182,10 +182,26 @@ function computeXVA(args: {
 
   /* ------------------ curves / discount / funding setup ---------------- */
 
-  const rOIS = Math.max(0, (csa.interestRate ?? 0.03) + rateShock);
-  const fundingSpread = 0.015 + spreadShock;
-  const rF = rOIS + fundingSpread;
-  const DF = (r: number, t: number) => Math.exp(-r * t);
+   // --- Curves (OIS & Funding) ------------------------------------------
+  const oisCurve = makeFlatCurve(Math.max(0, (csa.interestRate ?? 0.03) + rateShock));
+  const fndCurve = makeFlatCurve(Math.max(0, (csa.interestRate ?? 0.03) + 0.015 + spreadShock));
+
+  // Fast discount from curve
+  const DF_OIS = (t: number) => dfCurve(oisCurve, t);
+
+  // Funding-OIS forward differential on each time bucket (approx)
+  const fundingDiff = (t1: number, t2: number) =>
+    Math.max(0, fwdCurve(fndCurve, t1, t2) - fwdCurve(oisCurve, t1, t2));
+
+  // --- Hazard (from PD curve string) -----------------------------------
+  // Normalize user PDs (accepts % or decimals), create hazard & default density
+  const pdCum = normalizeCumPD(credit.pdCurve);
+  // Map the user's PD points onto our number of time steps by stretching/compressing
+  const timeSteps = Math.max(4, pdCum.length);
+  const dt = horizonYears / timeSteps;
+
+  const { dPD } = hazardFromCumPD(pdCum, dt);
+
 
   /* ----------------------------- exposures ----------------------------- */
 
@@ -251,15 +267,22 @@ function computeXVA(args: {
     );
   }
 
-  let CVA = 0,
-    FVA = 0,
-    MVA = 0;
+    // --- XVA components ---------------------------------------------------
+  let CVA = 0, FVA = 0, MVA = 0;
+
   for (let i = 0; i < timeSteps; i++) {
-    const t = (i + 1) * dt;
-    CVA += lgd * EPE[i] * margPD[i] * DF(rOIS, t);
-    FVA += EPE[i] * (rF - rOIS) * dt * DF(rOIS, t);
-    MVA += IMt[i] * (rF - rOIS) * dt * DF(rOIS, t);
+    const t1 = i * dt;
+    const t2 = (i + 1) * dt;
+    const tMid = t2; // cashflows at end of bucket (conservative)
+
+    const df = DF_OIS(tMid);
+    const spreadFwd = fundingDiff(t1, t2); // ~ (rF - rOIS) on the bucket
+
+    CVA += df * (credit.lgd ?? (1 - (credit.recoveryRate ?? 0.4))) * EPE[i] * dPD[i];
+    FVA += df * EPE[i] * spreadFwd * (t2 - t1);
+    MVA += df * IMt[i] * spreadFwd * (t2 - t1);
   }
+
   const KVA = reg.alphaFactor * reg.multiplier * 0.1 * CVA;
 
   return {
