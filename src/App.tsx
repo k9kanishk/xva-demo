@@ -481,18 +481,7 @@ const rho_per_bp       = rho * 1e-4;              // $ per 1 bp
 const theta_per_day    = theta / 252;             // $ per day
 
     // Scenario (user shocks)
-    const shocked = computeXVA({
-      trades,
-      csa,
-      sched,
-      credit,
-      reg,
-      paths: 20_000,
-      seed: 1337,
-      rateShock: sc.rateShock,
-      volShock: sc.volShock,
-      spreadShock: sc.creditSpreadShock,
-    });
+    
 
     setRes({
       cva: Math.round(base.cva),
