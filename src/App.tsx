@@ -4,7 +4,14 @@ import { validateInputs } from "./engine/validators"; // or same file
 
 const { ok, errors } = validateInputs({ csa, sched, credit, reg });
 
-<button onClick={calcGreeks} disabled={busy || !ok}>…</button>
+// Inside your App component's return (e.g., before or after other controls)
+<button onClick={calcGreeks} disabled={busy || !ok}>Calculate Greeks</button>
+<button onClick={resetToBase}>Reset</button>
+<button onClick={cloneAsShocked}>Clone as shocked</button>
+<label style={{cursor:"pointer"}}>
+  Import JSON
+  <input type="file" accept="application/json" onChange={e => e.target.files?.[0] && importJSON(e.target.files[0])} style={{display:"none"}} />
+</label>
 
 {!ok && (
   <div style={{marginTop:8, color:"#b00020"}}>
@@ -39,8 +46,7 @@ function cloneAsShocked() {
   // take current base numbers and apply your sc to produce a quick shocked set, then run calc
   calcGreeks();
 }
-<button onClick={resetToBase}>Reset</button>
-<button onClick={cloneAsShocked}>Clone as shocked</button>
+
 
 function importJSON(file: File) {
   const reader = new FileReader();
