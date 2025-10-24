@@ -2,76 +2,6 @@ import { CurvePt, makeFlatCurve, df as dfCurve, fwd as fwdCurve } from "./engine
 import { normalizeCumPD, hazardFromCumPD } from "./engine/hazards";
 import { validateInputs } from "./engine/validators"; // or same file
 
-const { ok, errors } = validateInputs({ csa, sched, credit, reg });
-
-// Inside your App component's return (e.g., before or after other controls)
-<button onClick={calcGreeks} disabled={busy || !ok}>Calculate Greeks</button>
-<button onClick={resetToBase}>Reset</button>
-<button onClick={cloneAsShocked}>Clone as shocked</button>
-<label style={{cursor:"pointer"}}>
-  Import JSON
-  <input type="file" accept="application/json" onChange={e => e.target.files?.[0] && importJSON(e.target.files[0])} style={{display:"none"}} />
-</label>
-
-{!ok && (
-  <div style={{marginTop:8, color:"#b00020"}}>
-    {errors.map((e,i)=><div key={i}>• {e}</div>)}
-  </div>
-)}
-
-const { readInitial } = useUrlState({ csa, sched, credit, reg, sc });
-
-// on init, hydrate state from URL if present
-useEffect(() => {
-  const init = readInitial({ csa, sched, credit, reg, sc });
-  setCsa(init.csa ?? csa);
-  setSched(init.sched ?? sched);
-  setCredit(init.credit ?? credit);
-  setReg(init.reg ?? reg);
-  setSc(init.sc ?? sc);
-  // eslint-disable-next-line
-}, []);
-
-const baseDefaults = { csa: { ...csa }, sched: { ...sched }, credit: { ...credit }, reg: { ...reg }, sc: { ...sc } };
-
-function resetToBase() {
-  setCsa({ threshold: 1_000_000, mta: 100_000, interestRate: 0.05, currency: "USD", independentAmount: 500_000 });
-  setSched({ frequency:"daily", haircut:0.02, marginType:"variation", rounding:10_000 });
-  setCredit({ pdCurve:"1,1.5,2,2.5,3", lgd:0.6, recoveryRate:0.4 });
-  setReg({ alphaFactor:1.4, multiplier:1.0 });
-  setSc({ rateShock:0.01, volShock:0.05, creditSpreadShock:0.02, correlationShock:0.1 });
-}
-
-function cloneAsShocked() {
-  // take current base numbers and apply your sc to produce a quick shocked set, then run calc
-  calcGreeks();
-}
-
-
-function importJSON(file: File) {
-  const reader = new FileReader();
-  reader.onload = () => {
-    try {
-      const data = JSON.parse(String(reader.result));
-      if (data?.inputs) {
-        setCsa(data.inputs.csa);
-        setSched(data.inputs.sched);
-        setCredit(data.inputs.credit);
-        setReg(data.inputs.reg);
-        setSc(data.inputs.scenario);
-      }
-      if (data?.results) setRes(data.results);
-    } catch (e) { alert("Invalid JSON"); }
-  };
-  reader.readAsText(file);
-}
-
-<label style={{cursor:"pointer"}}>
-  Import JSON
-  <input type="file" accept="application/json" onChange={e => e.target.files?.[0] && importJSON(e.target.files[0])} style={{display:"none"}} />
-</label>
-
-
 import { useEffect, useState } from "react";
 import {
   LineChart,
@@ -82,6 +12,81 @@ import {
   Tooltip,
   ResponsiveContainer,
 } from "recharts";
+
+// ======== PUT THIS *INSIDE* YOUR App COMPONENT (one paste) ========
+
+// (If you don't have a real validator yet, keep this call — it’s safe.)
+const { ok, errors } = (() => {
+  try {
+    return validateInputs({ csa, sched, credit, reg });
+  } catch {
+    return { ok: true, errors: [] as string[] };
+  }
+})();
+
+// actions
+function resetToBase() {
+  setCsa({ threshold: 1_000_000, mta: 100_000, interestRate: 0.05, currency: "USD", independentAmount: 500_000 });
+  setSched({ frequency: "daily", haircut: 0.02, marginType: "variation", rounding: 10_000 });
+  setCredit({ pdCurve: "1,1.5,2,2.5,3", lgd: 0.6, recoveryRate: 0.4 });
+  setReg({ alphaFactor: 1.4, multiplier: 1.0 });
+  setSc({ rateShock: 0.01, volShock: 0.05, creditSpreadShock: 0.02, correlationShock: 0.1 });
+}
+
+function cloneAsShocked() {
+  // re-run with current scenario shocks
+  calcGreeks();
+}
+
+function importJSON(file: File) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const data = JSON.parse(String(reader.result));
+      if (data?.inputs) {
+        setCsa(data.inputs.csa ?? csa);
+        setSched(data.inputs.sched ?? sched);
+        setCredit(data.inputs.credit ?? credit);
+        setReg(data.inputs.reg ?? reg);
+        setSc(data.inputs.scenario ?? sc);
+      }
+      if (data?.results) setRes(data.results);
+    } catch {
+      alert("Invalid JSON");
+    }
+  };
+  reader.readAsText(file);
+}
+
+// ======== IN YOUR JSX RETURN, RENDER THIS TOOLBAR + VALIDATION ========
+
+<div style={{ marginTop: 16, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+  <button onClick={calcGreeks} disabled={busy || !ok} style={{ padding: "10px 14px", fontWeight: 600 }}>
+    {busy ? `Calculating… ${progress}%` : "Calculate Greeks"}
+  </button>
+
+  <button onClick={resetToBase}>Reset</button>
+  <button onClick={cloneAsShocked}>Clone as shocked</button>
+
+  <label style={{ cursor: "pointer" }}>
+    Import JSON
+    <input
+      type="file"
+      accept="application/json"
+      onChange={(e) => e.target.files?.[0] && importJSON(e.target.files[0])}
+      style={{ display: "none" }}
+    />
+  </label>
+</div>
+
+{!ok && Array.isArray(errors) && errors.length > 0 && (
+  <div style={{ marginTop: 8, color: "#b00020" }}>
+    {errors.map((e: string, i: number) => (
+      <div key={i}>• {e}</div>
+    ))}
+  </div>
+)}
+
 
 /* --------------------------- helpers & types --------------------------- */
 
